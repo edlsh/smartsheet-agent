@@ -1,0 +1,10 @@
+{
+  "lockfileVersion": 1,
+  "prompts": {
+    "smartsheet-agent": {
+      "version": 8,
+      "versionId": "n5-7Pp108-64fWmjzhzId",
+      "materialized": "prompts/smartsheet-agent.prompt.yaml"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+query,expected_tool,expected_keywords,category,difficulty
+"What sheets do I have access to?",list_sheets,"sheets,access,available",navigation,easy
+"List all my Smartsheets",list_sheets,"sheets,list",navigation,easy
+"Show me my available sheets",list_sheets,"sheets,available",navigation,easy
+"Get all data from the Project Tracker sheet",get_sheet,"data,rows,columns",data_retrieval,easy
+"Show me the contents of sheet 12345",get_sheet,"data,sheet",data_retrieval,easy
+"What's in the Q4 Sales sheet?",get_sheet,"data,contents",data_retrieval,easy
+"Find all rows where Status is Complete",filter_rows,"rows,status,complete,filter",filtering,medium
+"Show me overdue tasks",filter_rows,"overdue,tasks,filter",filtering,medium
+"Filter projects by status In Progress",filter_rows,"projects,status,progress,filter",filtering,medium
+"How many projects are in each status?",count_rows_by_column,"count,status,breakdown",analytics,medium
+"Give me a status breakdown for the Tasks sheet",count_rows_by_column,"status,breakdown,count",analytics,medium
+"What's the distribution of priorities?",count_rows_by_column,"distribution,priorities,count",analytics,medium
+"Search for 'budget review' across all sheets",search,"search,budget,review",search,medium
+"Find mentions of John Smith",search,"search,find,john,smith",search,medium
+"List all my reports",report,"reports,list",navigation,easy
+"Show me the Executive Dashboard",sight,"dashboard,sight",navigation,easy
+"What workspaces do I have?",workspace,"workspaces,list",navigation,easy
+"Get details for workspace 67890",workspace,"workspace,details",navigation,medium
+"Show me attachments on the Project Tracker",attachment,"attachments,sheet",collaboration,medium
+"What comments are on this sheet?",discussion,"comments,discussion",collaboration,medium
+"Who has access to this sheet?",sheet_metadata,"access,shares,permissions",metadata,medium
+"Show me the automation rules",sheet_metadata,"automation,rules",metadata,medium
+"What columns does the Tasks sheet have?",sheet_info,"columns,metadata",metadata,easy
+"Get statistics for the Sales Pipeline",sheet_info,"statistics,stats,summary",analytics,medium
+"What's the history of changes to cell A1?",get_cell_history,"history,changes,cell",audit,hard
+"Show me recent events and changes",get_events,"events,audit,changes",audit,hard
+"Compare the old and new versions of my sheet",compare_sheets,"compare,differences",analytics,hard
+"Who am I logged in as?",get_current_user,"user,profile,current",system,easy
+"Can you create a new row for me?",NONE,"read-only,cannot,create",constraint,easy
+"Add a task to my sheet",NONE,"read-only,cannot,add",constraint,easy
+"Delete the completed tasks",NONE,"read-only,cannot,delete",constraint,easy
