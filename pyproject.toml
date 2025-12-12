@@ -3,7 +3,7 @@ name = "smartsheet-agent"
 version = "0.2.0"
 description = "AI agent for querying Smartsheet data - jobs, status updates, KPIs, and metrics. Built with Agno framework and supports multiple LLM providers via OpenRouter."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "Enzo Lucchesi", email = "enzo@lucchesi.dev"}
