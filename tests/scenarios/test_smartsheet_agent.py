@@ -86,10 +86,12 @@ async def test_agent_understands_list_sheets_request():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should understand the user wants to see available sheets",
-                "The agent should attempt to help with the request or explain why it cannot (such as missing credentials)",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should understand the user wants to see available sheets",
+                    "The agent should attempt to help with the request or explain why it cannot (such as missing credentials)",
+                ]
+            ),
         ],
         script=[
             scenario.user("What sheets do I have access to?"),
@@ -115,10 +117,12 @@ async def test_agent_handles_status_query():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should understand the user is asking about project or job status",
-                "The agent should attempt to help or explain what it needs (like API credentials) to assist",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should understand the user is asking about project or job status",
+                    "The agent should attempt to help or explain what it needs (like API credentials) to assist",
+                ]
+            ),
         ],
         script=[
             scenario.user("What's the current status of our active projects?"),
@@ -143,11 +147,13 @@ async def test_agent_explains_capabilities():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should explain it can help with Smartsheet data",
-                "The agent should mention some specific capabilities like viewing sheets, reports, or searching",
-                "The response should be informative and helpful",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should explain it can help with Smartsheet data",
+                    "The agent should mention some specific capabilities like viewing sheets, reports, or searching",
+                    "The response should be informative and helpful",
+                ]
+            ),
         ],
         script=[
             scenario.user("What can you help me with?"),
@@ -172,11 +178,13 @@ async def test_agent_understands_search_request():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should understand the user wants to search for data",
-                "The agent should offer to search or ask clarifying questions about what to search for",
-                "The response should be relevant to finding data in Smartsheets",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should understand the user wants to search for data",
+                    "The agent should offer to search or ask clarifying questions about what to search for",
+                    "The response should be relevant to finding data in Smartsheets",
+                ]
+            ),
         ],
         script=[
             scenario.user("Can you search for all items marked as 'overdue'?"),
@@ -201,10 +209,12 @@ async def test_agent_read_only_constraint():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should clearly communicate that it cannot create, update, or delete data",
-                "The agent should explain it has read-only access",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should clearly communicate that it cannot create, update, or delete data",
+                    "The agent should explain it has read-only access",
+                ]
+            ),
         ],
         script=[
             scenario.user("Can you add a new row to my project tracker sheet?"),
@@ -231,11 +241,13 @@ async def test_agent_uses_fuzzy_search_for_partial_sheet_names():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should search for sheets matching the user's description",
-                "The agent should identify or present potential matches to the user",
-                "The agent should be proactive in finding the sheet rather than just asking for the exact name",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should search for sheets matching the user's description",
+                    "The agent should identify or present potential matches to the user",
+                    "The agent should be proactive in finding the sheet rather than just asking for the exact name",
+                ]
+            ),
         ],
         script=[
             scenario.user("How many total jobs are in the job log retainer sheet?"),
@@ -261,11 +273,13 @@ async def test_agent_handles_informal_sheet_references():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should attempt to search for sheets matching the user's description",
-                "The agent should present search results or options to the user",
-                "The agent should proactively help find the sheet rather than just asking for the exact name",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should attempt to search for sheets matching the user's description",
+                    "The agent should present search results or options to the user",
+                    "The agent should proactively help find the sheet rather than just asking for the exact name",
+                ]
+            ),
         ],
         script=[
             scenario.user("Show me the status breakdown from that project tracker spreadsheet"),
@@ -292,14 +306,18 @@ async def test_agent_uses_efficient_analysis_for_complex_queries():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should search for the sheet or identify it from the user's description",
-                "The agent should acknowledge the user's request for comprehensive analysis",
-                "The agent should be helpful and offer to provide the requested information",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should search for the sheet or identify it from the user's description",
+                    "The agent should acknowledge the user's request for comprehensive analysis",
+                    "The agent should be helpful and offer to provide the requested information",
+                ]
+            ),
         ],
         script=[
-            scenario.user("Give me a full analysis of the Job-Log / Retainers sheet - how many rows, breakdown by status, and column info"),
+            scenario.user(
+                "Give me a full analysis of the Job-Log / Retainers sheet - how many rows, breakdown by status, and column info"
+            ),
             scenario.agent(),
             scenario.judge(),
         ],
@@ -324,14 +342,18 @@ async def test_agent_searches_for_columns_by_partial_name():
         agents=[
             SmartsheetAgentAdapter(),
             scenario.UserSimulatorAgent(),
-            scenario.JudgeAgent(criteria=[
-                "The agent should attempt to find or search for columns matching the user's description",
-                "The agent should either find a match or present similar column options",
-                "The agent should be proactive in helping resolve column names rather than just failing",
-            ])
+            scenario.JudgeAgent(
+                criteria=[
+                    "The agent should attempt to find or search for columns matching the user's description",
+                    "The agent should either find a match or present similar column options",
+                    "The agent should be proactive in helping resolve column names rather than just failing",
+                ]
+            ),
         ],
         script=[
-            scenario.user("In the Job-Log / Retainers sheet, filter by the status column where it shows active jobs"),
+            scenario.user(
+                "In the Job-Log / Retainers sheet, filter by the status column where it shows active jobs"
+            ),
             scenario.agent(),
             scenario.judge(),
         ],

@@ -13,9 +13,7 @@ load_dotenv()
 
 def pytest_configure(config):
     """Configure pytest with custom markers."""
-    config.addinivalue_line(
-        "markers", "agent_test: mark test as an agent scenario test"
-    )
+    config.addinivalue_line("markers", "agent_test: mark test as an agent scenario test")
 
 
 @pytest.fixture(scope="session", autouse=True)

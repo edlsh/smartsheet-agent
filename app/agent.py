@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 # Optional LangWatch integration
 try:
     import langwatch
+
     LANGWATCH_AVAILABLE = True
 except ImportError:
     LANGWATCH_AVAILABLE = False
@@ -219,9 +220,11 @@ def run_smartsheet_agent(
         The agent's response as a string
     """
     if LANGWATCH_AVAILABLE:
+
         @langwatch.trace(name="smartsheet_agent_run")
         def traced_run():
             return _run_smartsheet_agent_impl(query, user_id, session_id, model_id, stream)
+
         return traced_run()
     else:
         return _run_smartsheet_agent_impl(query, user_id, session_id, model_id, stream)

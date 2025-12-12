@@ -52,8 +52,8 @@ def run_parallel_tools(tool_calls: list[dict[str, Any]], timeout: int = 30) -> l
     futures = {}
 
     for call in tool_calls:
-        tool = call['tool']
-        kwargs = call.get('kwargs', {})
+        tool = call["tool"]
+        kwargs = call.get("kwargs", {})
         future = _executor.submit(tool, **kwargs)
         futures[future] = tool.__name__
 
@@ -61,17 +61,9 @@ def run_parallel_tools(tool_calls: list[dict[str, Any]], timeout: int = 30) -> l
         tool_name = futures[future]
         try:
             result = future.result()
-            results.append({
-                'tool_name': tool_name,
-                'result': result,
-                'error': None
-            })
+            results.append({"tool_name": tool_name, "result": result, "error": None})
         except Exception as e:
-            results.append({
-                'tool_name': tool_name,
-                'result': None,
-                'error': str(e)
-            })
+            results.append({"tool_name": tool_name, "result": None, "error": str(e)})
 
     return results
 
@@ -95,8 +87,8 @@ async def run_parallel_tools_async(tool_calls: list[dict[str, Any]]) -> list[dic
     tool_names = []
 
     for call in tool_calls:
-        tool = call['tool']
-        kwargs = call.get('kwargs', {})
+        tool = call["tool"]
+        kwargs = call.get("kwargs", {})
         tasks.append(run_tool(tool, kwargs))
         tool_names.append(tool.__name__)
 
@@ -105,17 +97,9 @@ async def run_parallel_tools_async(tool_calls: list[dict[str, Any]]) -> list[dic
 
     for i, result in enumerate(completed):
         if isinstance(result, Exception):
-            results.append({
-                'tool_name': tool_names[i],
-                'result': None,
-                'error': str(result)
-            })
+            results.append({"tool_name": tool_names[i], "result": None, "error": str(result)})
         else:
-            results.append({
-                'tool_name': tool_names[i],
-                'result': result,
-                'error': None
-            })
+            results.append({"tool_name": tool_names[i], "result": result, "error": None})
 
     return results
 
@@ -123,6 +107,7 @@ async def run_parallel_tools_async(tool_calls: list[dict[str, Any]]) -> list[dic
 # =============================================================================
 # PRE-BUILT PARALLEL WORKFLOWS
 # =============================================================================
+
 
 def get_organization_overview() -> str:
     """
@@ -136,12 +121,14 @@ def get_organization_overview() -> str:
     """
     start_time = time.time()
 
-    results = run_parallel_tools([
-        {'tool': list_sheets, 'kwargs': {}},
-        {'tool': workspace, 'kwargs': {}},
-        {'tool': report, 'kwargs': {}},
-        {'tool': sight, 'kwargs': {}},
-    ])
+    results = run_parallel_tools(
+        [
+            {"tool": list_sheets, "kwargs": {}},
+            {"tool": workspace, "kwargs": {}},
+            {"tool": report, "kwargs": {}},
+            {"tool": sight, "kwargs": {}},
+        ]
+    )
 
     elapsed = time.time() - start_time
 
@@ -149,7 +136,7 @@ def get_organization_overview() -> str:
     output += "=" * 60 + "\n\n"
 
     for r in results:
-        if r['error']:
+        if r["error"]:
             output += f"**{r['tool_name']}**: Error - {r['error']}\n\n"
         else:
             output += f"**{r['tool_name']}**:\n{r['result']}\n\n"
@@ -171,8 +158,7 @@ def parallel_search_sheets(query: str, sheet_ids: list[str]) -> str:
     start_time = time.time()
 
     tool_calls = [
-        {'tool': search, 'kwargs': {'query': query, 'sheet_id': sid}}
-        for sid in sheet_ids
+        {"tool": search, "kwargs": {"query": query, "sheet_id": sid}} for sid in sheet_ids
     ]
 
     results = run_parallel_tools(tool_calls)
@@ -183,7 +169,7 @@ def parallel_search_sheets(query: str, sheet_ids: list[str]) -> str:
     output += "=" * 60 + "\n\n"
 
     for r in results:
-        if r['error']:
+        if r["error"]:
             output += f"**Search Error**: {r['error']}\n\n"
         else:
             output += f"{r['result']}\n\n"
@@ -205,8 +191,7 @@ def parallel_get_sheets(sheet_ids: list[str], max_rows: int = 100) -> str:
     start_time = time.time()
 
     tool_calls = [
-        {'tool': get_sheet, 'kwargs': {'sheet_id': sid, 'max_rows': max_rows}}
-        for sid in sheet_ids
+        {"tool": get_sheet, "kwargs": {"sheet_id": sid, "max_rows": max_rows}} for sid in sheet_ids
     ]
 
     results = run_parallel_tools(tool_calls)
@@ -217,7 +202,7 @@ def parallel_get_sheets(sheet_ids: list[str], max_rows: int = 100) -> str:
     output += "=" * 60 + "\n\n"
 
     for r in results:
-        if r['error']:
+        if r["error"]:
             output += f"**Error**: {r['error']}\n\n"
         else:
             output += f"{r['result']}\n\n"
@@ -231,10 +216,12 @@ def get_home_and_favorites() -> str:
     """
     start_time = time.time()
 
-    results = run_parallel_tools([
-        {'tool': navigation, 'kwargs': {'view': 'home'}},
-        {'tool': navigation, 'kwargs': {'view': 'favorites'}},
-    ])
+    results = run_parallel_tools(
+        [
+            {"tool": navigation, "kwargs": {"view": "home"}},
+            {"tool": navigation, "kwargs": {"view": "favorites"}},
+        ]
+    )
 
     elapsed = time.time() - start_time
 
@@ -242,7 +229,7 @@ def get_home_and_favorites() -> str:
     output += "=" * 60 + "\n\n"
 
     for r in results:
-        if r['error']:
+        if r["error"]:
             output += f"**Error**: {r['error']}\n\n"
         else:
             output += f"{r['result']}\n\n"
@@ -254,6 +241,7 @@ def get_home_and_favorites() -> str:
 # WORKFLOW DETECTION & ROUTING
 # =============================================================================
 
+
 def detect_workflow_opportunity(query: str) -> str | None:
     """
     Detect if a query could benefit from a parallel workflow.
@@ -264,8 +252,13 @@ def detect_workflow_opportunity(query: str) -> str | None:
 
     # Organization overview patterns
     overview_patterns = [
-        "organization overview", "org overview", "everything", "all sheets",
-        "full overview", "comprehensive view", "show me everything"
+        "organization overview",
+        "org overview",
+        "everything",
+        "all sheets",
+        "full overview",
+        "comprehensive view",
+        "show me everything",
     ]
     if any(p in query_lower for p in overview_patterns):
         return "organization_overview"

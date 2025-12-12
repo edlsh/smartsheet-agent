@@ -46,8 +46,8 @@ from agno.tools import tool
 # =============================================================================
 
 # Cache configuration from environment
-CACHE_TTL_L1 = int(os.getenv("SMARTSHEET_CACHE_TTL_L1", "60"))      # L1: 1 minute (memory)
-CACHE_TTL_L2 = int(os.getenv("SMARTSHEET_CACHE_TTL_L2", "300"))     # L2: 5 minutes (disk)
+CACHE_TTL_L1 = int(os.getenv("SMARTSHEET_CACHE_TTL_L1", "60"))  # L1: 1 minute (memory)
+CACHE_TTL_L2 = int(os.getenv("SMARTSHEET_CACHE_TTL_L2", "300"))  # L2: 5 minutes (disk)
 CACHE_DIR = Path(os.getenv("SMARTSHEET_CACHE_DIR", "tmp/cache"))
 MAX_L1_ENTRIES = int(os.getenv("SMARTSHEET_CACHE_MAX_L1", "100"))
 
@@ -63,8 +63,12 @@ class MultiLevelCache:
     L2: Disk-based cache with longer TTL for persistence
     """
 
-    def __init__(self, l1_ttl: int = CACHE_TTL_L1, l2_ttl: int = CACHE_TTL_L2,
-                 max_l1_entries: int = MAX_L1_ENTRIES):
+    def __init__(
+        self,
+        l1_ttl: int = CACHE_TTL_L1,
+        l2_ttl: int = CACHE_TTL_L2,
+        max_l1_entries: int = MAX_L1_ENTRIES,
+    ):
         self.l1_ttl = l1_ttl
         self.l2_ttl = l2_ttl
         self.max_l1_entries = max_l1_entries
@@ -74,11 +78,14 @@ class MultiLevelCache:
     def _generate_key(self, func_name: str, args: tuple, kwargs: dict) -> str:
         """Generate a unique cache key based on function name and arguments."""
         # Sort kwargs for consistent hashing
-        key_data = json.dumps({
-            "func": func_name,
-            "args": [str(a) for a in args],
-            "kwargs": {k: str(v) for k, v in sorted(kwargs.items())}
-        }, sort_keys=True)
+        key_data = json.dumps(
+            {
+                "func": func_name,
+                "args": [str(a) for a in args],
+                "kwargs": {k: str(v) for k, v in sorted(kwargs.items())},
+            },
+            sort_keys=True,
+        )
         return hashlib.md5(key_data.encode()).hexdigest()
 
     def _get_l2_path(self, key: str) -> Path:
@@ -105,12 +112,12 @@ class MultiLevelCache:
         l2_path = self._get_l2_path(key)
         if l2_path.exists():
             try:
-                with open(l2_path, 'rb') as f:
+                with open(l2_path, "rb") as f:
                     data = pickle.load(f)
-                if time.time() - data['timestamp'] < self.l2_ttl:
+                if time.time() - data["timestamp"] < self.l2_ttl:
                     # Promote to L1
-                    self._set_l1(key, data['value'])
-                    return True, data['value']
+                    self._set_l1(key, data["value"])
+                    return True, data["value"]
                 else:
                     l2_path.unlink()  # Remove expired
             except (pickle.PickleError, KeyError, OSError):
@@ -139,11 +146,8 @@ class MultiLevelCache:
         # Set in L2 (disk)
         try:
             l2_path = self._get_l2_path(key)
-            with open(l2_path, 'wb') as f:
-                pickle.dump({
-                    'value': value,
-                    'timestamp': time.time()
-                }, f)
+            with open(l2_path, "wb") as f:
+                pickle.dump({"value": value, "timestamp": time.time()}, f)
         except (pickle.PickleError, OSError):
             pass  # Fail silently for disk cache
 
@@ -164,11 +168,7 @@ class MultiLevelCache:
         l2_count = len(list(CACHE_DIR.glob("*.pkl")))
         with self._lock:
             l1_count = len(self._l1_cache)
-        return {
-            "l1_entries": l1_count,
-            "l2_entries": l2_count,
-            "l1_max": self.max_l1_entries
-        }
+        return {"l1_entries": l1_count, "l2_entries": l2_count, "l1_max": self.max_l1_entries}
 
 
 # Global cache instance
@@ -180,6 +180,7 @@ def cached_tool(func):
     Decorator that adds multi-level caching to a tool function.
     Works alongside Agno's @tool decorator.
     """
+
     @wraps(func)
     def wrapper(*args, **kwargs):
         # Check cache
@@ -200,10 +201,7 @@ def cached_tool(func):
 # =============================================================================
 
 # Client singleton with TTL
-_client_cache = {
-    "client": None,
-    "created_at": 0
-}
+_client_cache = {"client": None, "created_at": 0}
 _client_lock = threading.Lock()
 
 
@@ -310,6 +308,7 @@ def get_cache_stats() -> dict:
 # CORE TOOLS (5) - with Agno @tool decorator and caching
 # =============================================================================
 
+
 @tool(cache_results=True)
 @cached_tool
 def list_sheets(use_cache: bool = True) -> str:
@@ -332,13 +331,15 @@ def list_sheets(use_cache: bool = True) -> str:
         for sheet in response.data:
             if not _is_sheet_allowed(sheet.id, sheet.name):
                 continue
-            sheets.append({
-                "id": sheet.id,
-                "name": sheet.name,
-                "access_level": sheet.access_level,
-                "created_at": str(sheet.created_at) if sheet.created_at else None,
-                "modified_at": str(sheet.modified_at) if sheet.modified_at else None,
-            })
+            sheets.append(
+                {
+                    "id": sheet.id,
+                    "name": sheet.name,
+                    "access_level": sheet.access_level,
+                    "created_at": str(sheet.created_at) if sheet.created_at else None,
+                    "modified_at": str(sheet.modified_at) if sheet.modified_at else None,
+                }
+            )
 
         if not sheets:
             return "No sheets available in the configured scope."
@@ -400,7 +401,8 @@ def get_sheet(sheet_id: str, max_rows: int = 1000) -> str:
             text_output += "Data:\n"
             for row in rows_data:
                 row_str = " | ".join(
-                    f"{k}: {v}" for k, v in row.items()
+                    f"{k}: {v}"
+                    for k, v in row.items()
                     if k not in ("row_id", "row_number") and v is not None
                 )
                 text_output += f"  Row {row['row_number']}: {row_str}\n"
@@ -449,8 +451,13 @@ def get_row(sheet_id: str, row_id: str) -> str:
 
 @tool(cache_results=True)
 @cached_tool
-def filter_rows(sheet_id: str, column_name: str, filter_value: str,
-                match_type: str = "contains", max_results: int = 50) -> str:
+def filter_rows(
+    sheet_id: str,
+    column_name: str,
+    filter_value: str,
+    match_type: str = "contains",
+    max_results: int = 50,
+) -> str:
     """
     Filter rows in a Smartsheet based on column values.
 
@@ -524,8 +531,7 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str,
         if matching_rows:
             for row in matching_rows:
                 row_str = " | ".join(
-                    f"{k}: {v}" for k, v in row.items()
-                    if k not in ("row_id",) and v is not None
+                    f"{k}: {v}" for k, v in row.items() if k not in ("row_id",) and v is not None
                 )
                 text_output += f"  {row_str}\n"
         else:
@@ -600,6 +606,7 @@ def count_rows_by_column(sheet_id: str, column_name: str) -> str:
 # UNIFIED RESOURCE TOOLS (7) - with caching
 # =============================================================================
 
+
 @tool(cache_results=True)
 @cached_tool
 def workspace(workspace_id: str = None) -> str:
@@ -616,19 +623,19 @@ def workspace(workspace_id: str = None) -> str:
             ws = client.Workspaces.get_workspace(int(workspace_id))
             text_output = f"Workspace: {ws.name}\n{'=' * 50}\n\n"
 
-            if hasattr(ws, 'access_level'):
+            if hasattr(ws, "access_level"):
                 text_output += f"Access Level: {ws.access_level}\n"
-            if hasattr(ws, 'permalink') and ws.permalink:
+            if hasattr(ws, "permalink") and ws.permalink:
                 text_output += f"Permalink: {ws.permalink}\n"
 
-            if hasattr(ws, 'sheets') and ws.sheets:
+            if hasattr(ws, "sheets") and ws.sheets:
                 allowed_sheets = [s for s in ws.sheets if _is_sheet_allowed(s.id, s.name)]
                 if allowed_sheets:
                     text_output += f"\n**Sheets ({len(allowed_sheets)}):**\n"
                     for sheet in allowed_sheets:
                         text_output += f"  - {sheet.name} (ID: {sheet.id})\n"
 
-            if hasattr(ws, 'folders') and ws.folders:
+            if hasattr(ws, "folders") and ws.folders:
                 text_output += f"\n**Folders ({len(ws.folders)}):**\n"
                 for folder in ws.folders:
                     text_output += f"  - {folder.name} (ID: {folder.id})\n"
@@ -641,7 +648,9 @@ def workspace(workspace_id: str = None) -> str:
 
             text_output = f"Found {len(response.data)} workspace(s):\n\n"
             for ws in response.data:
-                text_output += f"- {ws.name} (ID: {ws.id}, Access: {getattr(ws, 'access_level', 'Unknown')})\n"
+                text_output += (
+                    f"- {ws.name} (ID: {ws.id}, Access: {getattr(ws, 'access_level', 'Unknown')})\n"
+                )
 
             return text_output
     except Exception as e:
@@ -664,14 +673,14 @@ def folder(folder_id: str = None) -> str:
             f = client.Folders.get_folder(int(folder_id))
             text_output = f"Folder: {f.name}\n{'=' * 50}\n\n"
 
-            if hasattr(f, 'sheets') and f.sheets:
+            if hasattr(f, "sheets") and f.sheets:
                 allowed_sheets = [s for s in f.sheets if _is_sheet_allowed(s.id, s.name)]
                 if allowed_sheets:
                     text_output += f"\n**Sheets ({len(allowed_sheets)}):**\n"
                     for sheet in allowed_sheets:
                         text_output += f"  - {sheet.name} (ID: {sheet.id})\n"
 
-            if hasattr(f, 'folders') and f.folders:
+            if hasattr(f, "folders") and f.folders:
                 text_output += f"\n**Subfolders ({len(f.folders)}):**\n"
                 for subfolder in f.folders:
                     text_output += f"  - {subfolder.name} (ID: {subfolder.id})\n"
@@ -707,13 +716,13 @@ def sight(sight_id: str = None) -> str:
             s = client.Sights.get_sight(int(sight_id))
             text_output = f"Sight: {s.name}\n{'=' * 50}\n\n"
 
-            if hasattr(s, 'access_level'):
+            if hasattr(s, "access_level"):
                 text_output += f"Access Level: {s.access_level}\n"
-            if hasattr(s, 'widgets') and s.widgets:
+            if hasattr(s, "widgets") and s.widgets:
                 text_output += f"\n**Widgets ({len(s.widgets)}):**\n"
                 for widget in s.widgets:
-                    widget_type = getattr(widget, 'type', 'Unknown')
-                    title = getattr(widget, 'title', 'Untitled')
+                    widget_type = getattr(widget, "type", "Unknown")
+                    title = getattr(widget, "title", "Untitled")
                     text_output += f"  - {title} (Type: {widget_type})\n"
 
             return text_output
@@ -755,7 +764,9 @@ def report(report_id: str = None, max_rows: int = 100) -> str:
                     break
                 row_dict = {"row_number": row.row_number}
                 for cell in row.cells:
-                    col_name = columns.get(cell.virtual_column_id, f"Column_{cell.virtual_column_id}")
+                    col_name = columns.get(
+                        cell.virtual_column_id, f"Column_{cell.virtual_column_id}"
+                    )
                     row_dict[col_name] = cell.display_value or cell.value
                 rows_data.append(row_dict)
 
@@ -810,7 +821,9 @@ def webhook(webhook_id: str = None) -> str:
 
             text_output = f"Found {len(response.data)} webhook(s):\n\n"
             for w in response.data:
-                text_output += f"- {getattr(w, 'name', 'Unnamed')} (ID: {getattr(w, 'id', 'N/A')})\n"
+                text_output += (
+                    f"- {getattr(w, 'name', 'Unnamed')} (ID: {getattr(w, 'id', 'N/A')})\n"
+                )
 
             return text_output
     except Exception as e:
@@ -834,10 +847,10 @@ def group(group_id: str = None) -> str:
             text_output = f"Group: {g.name}\n{'=' * 50}\n\n"
             text_output += f"**ID:** {g.id}\n"
 
-            if hasattr(g, 'members') and g.members:
+            if hasattr(g, "members") and g.members:
                 text_output += f"\n**Members ({len(g.members)}):**\n"
                 for member in g.members:
-                    email = getattr(member, 'email', 'Unknown')
+                    email = getattr(member, "email", "Unknown")
                     text_output += f"  - {email}\n"
 
             return text_output
@@ -870,7 +883,7 @@ def user(user_id: str = None, max_results: int = 50) -> str:
         client = get_smartsheet_client()
 
         if user_id:
-            if '@' in str(user_id):
+            if "@" in str(user_id):
                 response = client.Users.list_users(email=user_id)
                 if response.data:
                     user_id = response.data[0].id
@@ -878,7 +891,9 @@ def user(user_id: str = None, max_results: int = 50) -> str:
                     return f"Error: User with email '{user_id}' not found"
 
             u = client.Users.get_user(int(user_id))
-            name = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+            name = (
+                f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+            )
             text_output = f"User Profile\n{'=' * 50}\n\n"
             text_output += f"**Name:** {name or 'N/A'}\n"
             text_output += f"**Email:** {getattr(u, 'email', 'N/A')}\n"
@@ -896,7 +911,7 @@ def user(user_id: str = None, max_results: int = 50) -> str:
 
             return text_output
     except Exception as e:
-        if '1003' in str(e) or 'not authorized' in str(e).lower():
+        if "1003" in str(e) or "not authorized" in str(e).lower():
             return "Error: You must be a System Admin to access user information."
         return f"Error with user: {str(e)}"
 
@@ -904,6 +919,7 @@ def user(user_id: str = None, max_results: int = 50) -> str:
 # =============================================================================
 # UNIFIED SCOPE TOOLS (2)
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -935,11 +951,13 @@ def attachment(sheet_id: str, row_id: str = None, attachment_id: str = None) -> 
             att = client.Attachments.get_attachment(resolved_id, int(attachment_id))
             text_output = f"Attachment: {getattr(att, 'name', 'N/A')}\n"
             text_output += f"Type: {getattr(att, 'attachment_type', 'Unknown')}\n"
-            if hasattr(att, 'url') and att.url:
+            if hasattr(att, "url") and att.url:
                 text_output += f"\n**Download URL** (temporary): {att.url}\n"
             return text_output
         elif row_id:
-            attachments = client.Attachments.list_row_attachments(resolved_id, int(row_id), include_all=True)
+            attachments = client.Attachments.list_row_attachments(
+                resolved_id, int(row_id), include_all=True
+            )
             text_output = f"Attachments for Row {row_id}:\n"
             if attachments.data:
                 for att in attachments.data:
@@ -986,7 +1004,9 @@ def discussion(sheet_id: str, row_id: str = None) -> str:
         sheet = client.Sheets.get_sheet(resolved_id)
 
         if row_id:
-            discussions = client.Discussions.get_row_discussions(resolved_id, int(row_id), include_all=True)
+            discussions = client.Discussions.get_row_discussions(
+                resolved_id, int(row_id), include_all=True
+            )
             text_output = f"Discussions for Row {row_id}:\n"
         else:
             discussions = client.Discussions.get_all_discussions(resolved_id, include_all=True)
@@ -995,11 +1015,11 @@ def discussion(sheet_id: str, row_id: str = None) -> str:
         if discussions.data:
             for disc in discussions.data:
                 text_output += f"\nDiscussion (ID: {disc.id})\n"
-                if hasattr(disc, 'comments') and disc.comments:
+                if hasattr(disc, "comments") and disc.comments:
                     for comment in disc.comments[:3]:
                         author = "Unknown"
-                        if hasattr(comment, 'created_by') and comment.created_by:
-                            author = getattr(comment.created_by, 'name', 'Unknown')
+                        if hasattr(comment, "created_by") and comment.created_by:
+                            author = getattr(comment.created_by, "name", "Unknown")
                         text_output += f"  - {author}: {comment.text[:100]}...\n"
         else:
             text_output += "No discussions found.\n"
@@ -1012,6 +1032,7 @@ def discussion(sheet_id: str, row_id: str = None) -> str:
 # =============================================================================
 # UNIFIED SEARCH (1)
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -1047,8 +1068,8 @@ def search(query: str, sheet_id: str = None, max_results: int = 20) -> str:
         text_output += f"Found {results.total_count} result(s):\n\n"
 
         for i, result in enumerate(results.results[:max_results], 1):
-            text = getattr(result, 'text', 'N/A')
-            obj_type = getattr(result, 'object_type', 'Unknown')
+            text = getattr(result, "text", "N/A")
+            obj_type = getattr(result, "object_type", "Unknown")
             text_output += f"{i}. {obj_type}: {text}\n"
 
         return text_output
@@ -1059,6 +1080,7 @@ def search(query: str, sheet_id: str = None, max_results: int = 20) -> str:
 # =============================================================================
 # UNIFIED NAVIGATION (1)
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -1079,8 +1101,8 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
 
             text_output = f"Your Favorites ({len(response.data)} items)\n{'=' * 50}\n\n"
             for fav in response.data:
-                obj_type = getattr(fav, 'type', 'unknown')
-                obj_id = getattr(fav, 'object_id', None)
+                obj_type = getattr(fav, "type", "unknown")
+                obj_id = getattr(fav, "object_id", None)
                 text_output += f"- {obj_type}: ID {obj_id}\n"
 
             return text_output
@@ -1089,7 +1111,7 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
             home = client.Home.list_all_contents()
             text_output = f"Available Templates\n{'=' * 50}\n\n"
 
-            if hasattr(home, 'templates') and home.templates:
+            if hasattr(home, "templates") and home.templates:
                 for tmpl in home.templates:
                     text_output += f"- {tmpl.name} (ID: {tmpl.id})\n"
             else:
@@ -1101,14 +1123,14 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
             home = client.Home.list_all_contents()
             text_output = f"Your Smartsheet Home\n{'=' * 50}\n\n"
 
-            if hasattr(home, 'sheets') and home.sheets:
+            if hasattr(home, "sheets") and home.sheets:
                 allowed = [s for s in home.sheets if _is_sheet_allowed(s.id, s.name)]
                 if allowed:
                     text_output += f"**Sheets ({len(allowed)}):**\n"
                     for sheet in allowed[:20]:
                         text_output += f"  - {sheet.name} (ID: {sheet.id})\n"
 
-            if hasattr(home, 'workspaces') and home.workspaces:
+            if hasattr(home, "workspaces") and home.workspaces:
                 text_output += f"\n**Workspaces ({len(home.workspaces)}):**\n"
                 for ws in home.workspaces[:10]:
                     text_output += f"  - {ws.name} (ID: {ws.id})\n"
@@ -1122,9 +1144,12 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
 # UNIFIED SHEET METADATA (1)
 # =============================================================================
 
+
 @tool(cache_results=True)
 @cached_tool
-def sheet_metadata(sheet_id: str, info: Literal["automation", "shares", "publish", "proofs", "references"]) -> str:
+def sheet_metadata(
+    sheet_id: str, info: Literal["automation", "shares", "publish", "proofs", "references"]
+) -> str:
     """
     Get various metadata about a sheet.
 
@@ -1162,8 +1187,8 @@ def sheet_metadata(sheet_id: str, info: Literal["automation", "shares", "publish
             text_output = f"Sharing for '{sheet.name}':\n"
             if shares.data:
                 for share in shares.data:
-                    email = getattr(share, 'email', 'N/A')
-                    level = getattr(share, 'access_level', 'Unknown')
+                    email = getattr(share, "email", "N/A")
+                    level = getattr(share, "access_level", "Unknown")
                     text_output += f"- {email}: {level}\n"
             else:
                 text_output += "No shares found.\n"
@@ -1202,10 +1227,14 @@ def sheet_metadata(sheet_id: str, info: Literal["automation", "shares", "publish
 # UNIFIED SHEET INFO (1)
 # =============================================================================
 
+
 @tool(cache_results=True)
 @cached_tool
-def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields", "by_column"],
-               columns: str = None) -> str:
+def sheet_info(
+    sheet_id: str,
+    info: Literal["columns", "stats", "summary_fields", "by_column"],
+    columns: str = None,
+) -> str:
     """
     Get sheet information by type.
 
@@ -1233,7 +1262,7 @@ def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields"
             text_output = f"Columns for '{sheet.name}':\n{'=' * 50}\n\n"
             for col in sheet.columns:
                 text_output += f"- {col.title} (ID: {col.id}, Type: {col.type})\n"
-                if hasattr(col, 'options') and col.options:
+                if hasattr(col, "options") and col.options:
                     text_output += f"    Options: {', '.join(col.options)}\n"
             return text_output
 
@@ -1257,10 +1286,10 @@ def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields"
         elif info == "summary_fields":
             text_output = f"Summary Fields for '{sheet.name}':\n{'=' * 50}\n\n"
 
-            if hasattr(sheet, 'summary') and sheet.summary and hasattr(sheet.summary, 'fields'):
+            if hasattr(sheet, "summary") and sheet.summary and hasattr(sheet.summary, "fields"):
                 for field in sheet.summary.fields:
-                    title = getattr(field, 'title', 'Untitled')
-                    value = getattr(field, 'display_value', getattr(field, 'object_value', 'N/A'))
+                    title = getattr(field, "title", "Untitled")
+                    value = getattr(field, "display_value", getattr(field, "object_value", "N/A"))
                     text_output += f"- {title}: {value}\n"
             else:
                 text_output += "No summary fields found.\n"
@@ -1280,7 +1309,9 @@ def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields"
             if not col_id_map:
                 return f"Error: None of the specified columns found. Available: {', '.join([c.title for c in sheet.columns])}"
 
-            text_output = f"Data from '{sheet.name}' - Columns: {', '.join(col_id_map.values())}\n\n"
+            text_output = (
+                f"Data from '{sheet.name}' - Columns: {', '.join(col_id_map.values())}\n\n"
+            )
 
             for row in sheet.rows[:50]:  # Limit to 50 rows
                 row_data = []
@@ -1304,6 +1335,7 @@ def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields"
 # =============================================================================
 # UNIFIED UPDATE REQUESTS (1)
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -1349,6 +1381,7 @@ def update_requests(sheet_id: str, sent: bool = False) -> str:
 # =============================================================================
 # STANDALONE TOOLS (9)
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -1462,15 +1495,17 @@ def get_cell_history(sheet_id: str, row_id: str, column_id: str) -> str:
                     column_id = col.id
                     break
 
-        history = client.Cells.get_cell_history(int(sheet_id), int(row_id), int(column_id), include_all=True)
+        history = client.Cells.get_cell_history(
+            int(sheet_id), int(row_id), int(column_id), include_all=True
+        )
 
         text_output = f"Cell History:\n{'=' * 50}\n\n"
 
         if history.data:
             for entry in history.data:
-                modified_at = getattr(entry, 'modified_at', 'Unknown')
-                modified_by = getattr(entry, 'modified_by', {})
-                user_name = getattr(modified_by, 'name', 'Unknown')
+                modified_at = getattr(entry, "modified_at", "Unknown")
+                modified_by = getattr(entry, "modified_by", {})
+                user_name = getattr(modified_by, "name", "Unknown")
                 value = entry.display_value or entry.value
                 text_output += f"- {modified_at}: {value} (by {user_name})\n"
         else:
@@ -1526,7 +1561,7 @@ def get_events(days_back: int = 7, max_count: int = 50) -> str:
         client = get_smartsheet_client()
 
         since = datetime.utcnow() - timedelta(days=days_back)
-        since_str = since.strftime('%Y-%m-%dT%H:%M:%SZ')
+        since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         events = client.Events.list_events(since=since_str, max_count=max_count)
 
@@ -1534,15 +1569,15 @@ def get_events(days_back: int = 7, max_count: int = 50) -> str:
 
         if events.data:
             for event in events.data:
-                event_type = getattr(event, 'event_type', 'Unknown')
-                timestamp = getattr(event, 'event_timestamp', 'N/A')
+                event_type = getattr(event, "event_type", "Unknown")
+                timestamp = getattr(event, "event_timestamp", "N/A")
                 text_output += f"- {timestamp}: {event_type}\n"
         else:
             text_output += "No events found.\n"
 
         return text_output
     except Exception as e:
-        if 'not authorized' in str(e).lower() or '1003' in str(e):
+        if "not authorized" in str(e).lower() or "1003" in str(e):
             return "Error: Events API requires Enterprise plan with appropriate permissions."
         return f"Error getting events: {str(e)}"
 
@@ -1577,8 +1612,8 @@ def get_contacts() -> str:
 
         if contacts.data:
             for contact in contacts.data:
-                name = getattr(contact, 'name', 'N/A')
-                email = getattr(contact, 'email', 'N/A')
+                name = getattr(contact, "name", "N/A")
+                email = getattr(contact, "email", "N/A")
                 text_output += f"- {name} ({email})\n"
         else:
             text_output += "No contacts found.\n"
@@ -1598,10 +1633,10 @@ def get_server_info() -> str:
 
         text_output = f"Server Info\n{'=' * 50}\n\n"
 
-        if hasattr(info, 'supported_locales'):
+        if hasattr(info, "supported_locales"):
             text_output += f"Supported Locales: {len(info.supported_locales)}\n"
 
-        if hasattr(info, 'formats'):
+        if hasattr(info, "formats"):
             text_output += "Formats Available: Yes\n"
 
         return text_output
@@ -1633,7 +1668,7 @@ def list_org_sheets(max_results: int = 100) -> str:
 
         return text_output
     except Exception as e:
-        if 'not authorized' in str(e).lower():
+        if "not authorized" in str(e).lower():
             return "Error: This feature requires System Admin permissions."
         return f"Error listing org sheets: {str(e)}"
 
@@ -1670,7 +1705,7 @@ def get_image_urls(sheet_id: str, row_id: str, column_id_or_name: str) -> str:
         image_id = None
         for cell in row.cells:
             if cell.column_id == int(column_id):
-                if hasattr(cell, 'image') and cell.image:
+                if hasattr(cell, "image") and cell.image:
                     image_id = cell.image.id
                 break
 
@@ -1679,9 +1714,7 @@ def get_image_urls(sheet_id: str, row_id: str, column_id_or_name: str) -> str:
 
         # Get image URL
         url_response = client.Sheets.get_row_cell_image_urls(
-            int(sheet_id),
-            int(row_id),
-            [{"columnId": int(column_id), "imageId": image_id}]
+            int(sheet_id), int(row_id), [{"columnId": int(column_id), "imageId": image_id}]
         )
 
         text_output = "Image URL:\n"
@@ -1700,20 +1733,23 @@ def get_image_urls(sheet_id: str, row_id: str, column_id_or_name: str) -> str:
 # FUZZY SHEET SEARCH (1) - Helps users find sheets by partial/approximate names
 # =============================================================================
 
+
 def _calculate_similarity(s1: str, s2: str) -> float:
     """
     Calculate similarity ratio between two strings using sequence matching.
     Returns a score between 0.0 and 1.0.
     """
     from difflib import SequenceMatcher
+
     return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
 
 
 def _tokenize(text: str) -> set:
     """Extract meaningful tokens from text for word-based matching."""
     import re
+
     # Split on non-alphanumeric characters and filter short tokens
-    tokens = re.split(r'[^a-zA-Z0-9]+', text.lower())
+    tokens = re.split(r"[^a-zA-Z0-9]+", text.lower())
     return {t for t in tokens if len(t) >= 2}
 
 
@@ -1767,17 +1803,19 @@ def find_sheets(query: str, max_results: int = 5, include_ids: bool = True) -> s
 
             # Calculate different match scores
             scores = {
-                'exact': 1.0 if sheet_name_lower == query_lower else 0.0,
-                'contains': 1.0 if query_lower in sheet_name_lower else 0.0,
-                'contained': 0.8 if sheet_name_lower in query_lower else 0.0,
-                'similarity': _calculate_similarity(query_lower, sheet_name_lower),
-                'word_match': 0.0,
+                "exact": 1.0 if sheet_name_lower == query_lower else 0.0,
+                "contains": 1.0 if query_lower in sheet_name_lower else 0.0,
+                "contained": 0.8 if sheet_name_lower in query_lower else 0.0,
+                "similarity": _calculate_similarity(query_lower, sheet_name_lower),
+                "word_match": 0.0,
             }
 
             # Word-based matching (how many query tokens appear in sheet name)
             if query_tokens:
                 matching_tokens = query_tokens & sheet_tokens
-                scores['word_match'] = len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+                scores["word_match"] = (
+                    len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+                )
 
             # Also check if any sheet token contains any query token (partial word match)
             partial_word_score = 0.0
@@ -1785,35 +1823,43 @@ def find_sheets(query: str, max_results: int = 5, include_ids: bool = True) -> s
                 for st in sheet_tokens:
                     if qt in st or st in qt:
                         partial_word_score = max(partial_word_score, 0.6)
-            scores['partial_word'] = partial_word_score
+            scores["partial_word"] = partial_word_score
 
             # Compute weighted overall score
             overall_score = (
-                scores['exact'] * 2.0 +           # Exact match is best
-                scores['contains'] * 1.5 +        # Query in sheet name is very good
-                scores['contained'] * 0.8 +       # Sheet name in query is okay
-                scores['word_match'] * 1.2 +      # Word overlap is good
-                scores['partial_word'] * 0.8 +    # Partial word match is okay
-                scores['similarity'] * 0.5        # Overall similarity
+                scores["exact"] * 2.0  # Exact match is best
+                + scores["contains"] * 1.5  # Query in sheet name is very good
+                + scores["contained"] * 0.8  # Sheet name in query is okay
+                + scores["word_match"] * 1.2  # Word overlap is good
+                + scores["partial_word"] * 0.8  # Partial word match is okay
+                + scores["similarity"] * 0.5  # Overall similarity
             ) / 6.7  # Normalize to roughly 0-1 range
 
             if overall_score > 0.1:  # Minimum threshold
-                match_type = "exact" if scores['exact'] > 0 else \
-                            "contains" if scores['contains'] > 0 else \
-                            "word match" if scores['word_match'] > 0.5 else \
-                            "partial" if scores['partial_word'] > 0 else \
-                            "similar"
+                match_type = (
+                    "exact"
+                    if scores["exact"] > 0
+                    else "contains"
+                    if scores["contains"] > 0
+                    else "word match"
+                    if scores["word_match"] > 0.5
+                    else "partial"
+                    if scores["partial_word"] > 0
+                    else "similar"
+                )
 
-                matches.append({
-                    'name': sheet_name,
-                    'id': sheet.id,
-                    'score': overall_score,
-                    'match_type': match_type,
-                    'access_level': getattr(sheet, 'access_level', 'Unknown'),
-                })
+                matches.append(
+                    {
+                        "name": sheet_name,
+                        "id": sheet.id,
+                        "score": overall_score,
+                        "match_type": match_type,
+                        "access_level": getattr(sheet, "access_level", "Unknown"),
+                    }
+                )
 
         # Sort by score descending and limit results
-        matches.sort(key=lambda x: x['score'], reverse=True)
+        matches.sort(key=lambda x: x["score"], reverse=True)
         matches = matches[:max_results]
 
         if not matches:
@@ -1827,7 +1873,9 @@ def find_sheets(query: str, max_results: int = 5, include_ids: bool = True) -> s
         text_output = f"Found {len(matches)} sheet(s) matching '{query}':\n\n"
 
         for i, match in enumerate(matches, 1):
-            confidence = "HIGH" if match['score'] > 0.7 else "MEDIUM" if match['score'] > 0.4 else "LOW"
+            confidence = (
+                "HIGH" if match["score"] > 0.7 else "MEDIUM" if match["score"] > 0.4 else "LOW"
+            )
             text_output += f"{i}. {match['name']}"
             if include_ids:
                 text_output += f" (ID: {match['id']})"
@@ -1843,6 +1891,7 @@ def find_sheets(query: str, max_results: int = 5, include_ids: bool = True) -> s
 # =============================================================================
 # FUZZY COLUMN SEARCH (1) - Helps users find columns by partial/approximate names
 # =============================================================================
+
 
 @tool(cache_results=True)
 @cached_tool
@@ -1878,7 +1927,9 @@ def find_columns(sheet_id: str, query: str, max_results: int = 5) -> str:
         resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
 
         if not resolved_id:
-            return f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
+            return (
+                f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
+            )
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
             return "Error: Access to sheet is not permitted."
@@ -1900,17 +1951,19 @@ def find_columns(sheet_id: str, query: str, max_results: int = 5) -> str:
 
             # Calculate different match scores
             scores = {
-                'exact': 1.0 if col_name_lower == query_lower else 0.0,
-                'contains': 1.0 if query_lower in col_name_lower else 0.0,
-                'contained': 0.8 if col_name_lower in query_lower else 0.0,
-                'similarity': _calculate_similarity(query_lower, col_name_lower),
-                'word_match': 0.0,
+                "exact": 1.0 if col_name_lower == query_lower else 0.0,
+                "contains": 1.0 if query_lower in col_name_lower else 0.0,
+                "contained": 0.8 if col_name_lower in query_lower else 0.0,
+                "similarity": _calculate_similarity(query_lower, col_name_lower),
+                "word_match": 0.0,
             }
 
             # Word-based matching
             if query_tokens:
                 matching_tokens = query_tokens & col_tokens
-                scores['word_match'] = len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+                scores["word_match"] = (
+                    len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+                )
 
             # Partial word match
             partial_word_score = 0.0
@@ -1918,36 +1971,44 @@ def find_columns(sheet_id: str, query: str, max_results: int = 5) -> str:
                 for ct in col_tokens:
                     if qt in ct or ct in qt:
                         partial_word_score = max(partial_word_score, 0.6)
-            scores['partial_word'] = partial_word_score
+            scores["partial_word"] = partial_word_score
 
             # Compute weighted overall score
             overall_score = (
-                scores['exact'] * 2.0 +
-                scores['contains'] * 1.5 +
-                scores['contained'] * 0.8 +
-                scores['word_match'] * 1.2 +
-                scores['partial_word'] * 0.8 +
-                scores['similarity'] * 0.5
+                scores["exact"] * 2.0
+                + scores["contains"] * 1.5
+                + scores["contained"] * 0.8
+                + scores["word_match"] * 1.2
+                + scores["partial_word"] * 0.8
+                + scores["similarity"] * 0.5
             ) / 6.7
 
             if overall_score > 0.1:
-                match_type = "exact" if scores['exact'] > 0 else \
-                            "contains" if scores['contains'] > 0 else \
-                            "word match" if scores['word_match'] > 0.5 else \
-                            "partial" if scores['partial_word'] > 0 else \
-                            "similar"
+                match_type = (
+                    "exact"
+                    if scores["exact"] > 0
+                    else "contains"
+                    if scores["contains"] > 0
+                    else "word match"
+                    if scores["word_match"] > 0.5
+                    else "partial"
+                    if scores["partial_word"] > 0
+                    else "similar"
+                )
 
-                matches.append({
-                    'name': col_name,
-                    'id': col.id,
-                    'type': col.type,
-                    'score': overall_score,
-                    'match_type': match_type,
-                    'options': getattr(col, 'options', None),
-                })
+                matches.append(
+                    {
+                        "name": col_name,
+                        "id": col.id,
+                        "type": col.type,
+                        "score": overall_score,
+                        "match_type": match_type,
+                        "options": getattr(col, "options", None),
+                    }
+                )
 
         # Sort by score descending
-        matches.sort(key=lambda x: x['score'], reverse=True)
+        matches.sort(key=lambda x: x["score"], reverse=True)
         matches = matches[:max_results]
 
         if not matches:
@@ -1960,17 +2021,19 @@ def find_columns(sheet_id: str, query: str, max_results: int = 5) -> str:
         text_output = f"Found {len(matches)} column(s) matching '{query}' in '{sheet.name}':\n\n"
 
         for i, match in enumerate(matches, 1):
-            confidence = "HIGH" if match['score'] > 0.7 else "MEDIUM" if match['score'] > 0.4 else "LOW"
-            text_output += f"{i}. \"{match['name']}\" (Type: {match['type']})\n"
+            confidence = (
+                "HIGH" if match["score"] > 0.7 else "MEDIUM" if match["score"] > 0.4 else "LOW"
+            )
+            text_output += f'{i}. "{match["name"]}" (Type: {match["type"]})\n'
             text_output += f"   Match: {match['match_type'].upper()} | Confidence: {confidence}\n"
-            if match['options']:
+            if match["options"]:
                 text_output += f"   Options: {', '.join(match['options'][:5])}"
-                if len(match['options']) > 5:
+                if len(match["options"]) > 5:
                     text_output += f" (+{len(match['options']) - 5} more)"
                 text_output += "\n"
 
-        if len(matches) == 1 and matches[0]['score'] > 0.7:
-            text_output += f"\n✓ Best match: \"{matches[0]['name']}\" - proceeding with this column."
+        if len(matches) == 1 and matches[0]["score"] > 0.7:
+            text_output += f'\n✓ Best match: "{matches[0]["name"]}" - proceeding with this column.'
         else:
             text_output += "\n**Reply with the number (e.g., '1') to select a column**, or use the exact column name."
 
@@ -2058,7 +2121,9 @@ def analyze_sheet(
         resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
 
         if not resolved_id:
-            return f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
+            return (
+                f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
+            )
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
             return "Error: Access to sheet is not permitted."
@@ -2103,7 +2168,9 @@ def analyze_sheet(
             type_counts = {}
             for col in sheet.columns:
                 type_counts[col.type] = type_counts.get(col.type, 0) + 1
-            text_output += f"- Column Types: {', '.join(f'{t}({c})' for t, c in type_counts.items())}\n"
+            text_output += (
+                f"- Column Types: {', '.join(f'{t}({c})' for t, c in type_counts.items())}\n"
+            )
             text_output += "\n"
 
         # ── COLUMNS ──
@@ -2111,10 +2178,10 @@ def analyze_sheet(
             text_output += "## Columns\n"
             for i, col in enumerate(sheet.columns, 1):
                 text_output += f"{i}. {col.title} ({col.type})"
-                if hasattr(col, 'options') and col.options:
+                if hasattr(col, "options") and col.options:
                     text_output += f" - Options: {', '.join(col.options[:3])}"
                     if len(col.options) > 3:
-                        text_output += f" +{len(col.options)-3} more"
+                        text_output += f" +{len(col.options) - 3} more"
                 text_output += "\n"
             text_output += "\n"
 
@@ -2178,7 +2245,9 @@ def analyze_sheet(
 
                     # Show first 10 matches
                     for row in matching_rows[:10]:
-                        row_str = " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None and k != "row_num")
+                        row_str = " | ".join(
+                            f"{k}: {v}" for k, v in row.items() if v is not None and k != "row_num"
+                        )
                         text_output += f"  Row {row['row_num']}: {row_str[:100]}{'...' if len(row_str) > 100 else ''}\n"
 
                     if len(matching_rows) > 10:
@@ -2282,10 +2351,7 @@ SMARTSHEET_TOOLS = [
 ]
 
 # Async versions for all tools
-SMARTSHEET_TOOLS_ASYNC = {
-    tool.name: lambda t=tool: run_async(t)
-    for tool in SMARTSHEET_TOOLS
-}
+SMARTSHEET_TOOLS_ASYNC = {tool.name: lambda t=tool: run_async(t) for tool in SMARTSHEET_TOOLS}
 
 
 if __name__ == "__main__":

@@ -106,5 +106,5 @@ jobs:
       
       - name: Check package
         run: |
-          uv pip install twine
-          uv run twine check dist/*
+          pip install twine
+          twine check dist/*

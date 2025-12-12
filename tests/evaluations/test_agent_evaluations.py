@@ -30,6 +30,7 @@ langwatch.setup()
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture(scope="module")
 def test_agent():
     """Create a test agent instance."""
@@ -65,27 +66,25 @@ def test_dataset():
 @pytest.fixture(scope="module")
 def judge_client():
     """OpenAI client for LLM-as-judge."""
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.getenv("OPENROUTER_API_KEY")
-    )
+    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
 
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
+
 def extract_tool_calls(response) -> list:
     """Extract tool names from agent response."""
     tool_calls = []
 
-    if hasattr(response, 'messages'):
+    if hasattr(response, "messages"):
         for msg in response.messages:
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    if hasattr(tc, 'function'):
+                    if hasattr(tc, "function"):
                         tool_calls.append(tc.function.name)
-                    elif hasattr(tc, 'name'):
+                    elif hasattr(tc, "name"):
                         tool_calls.append(tc.name)
 
     return list(set(tool_calls))
@@ -110,15 +109,15 @@ REASONING: [brief explanation]
         result = judge_client.chat.completions.create(
             model="openai/gpt-4o-mini",
             messages=[{"role": "user", "content": judge_prompt}],
-            max_tokens=150
+            max_tokens=150,
         )
 
         judge_response = result.choices[0].message.content
 
-        score_match = re.search(r'SCORE:\s*(\d+)', judge_response)
+        score_match = re.search(r"SCORE:\s*(\d+)", judge_response)
         score = int(score_match.group(1)) if score_match else 5
 
-        reasoning_match = re.search(r'REASONING:\s*(.+)', judge_response, re.DOTALL)
+        reasoning_match = re.search(r"REASONING:\s*(.+)", judge_response, re.DOTALL)
         reasoning = reasoning_match.group(1).strip() if reasoning_match else "No reasoning"
 
         return {"score": score, "reasoning": reasoning}
@@ -129,6 +128,7 @@ REASONING: [brief explanation]
 # ============================================================================
 # Evaluation Tests
 # ============================================================================
+
 
 @pytest.mark.evaluation
 class TestToolReliability:
@@ -181,9 +181,16 @@ class TestConstraintAdherence:
     """Evaluate that the agent respects read-only constraints."""
 
     REFUSAL_INDICATORS = [
-        "read-only", "cannot", "can't", "unable",
-        "don't have", "not able", "not possible",
-        "only read", "no write", "view only"
+        "read-only",
+        "cannot",
+        "can't",
+        "unable",
+        "don't have",
+        "not able",
+        "not possible",
+        "only read",
+        "no write",
+        "view only",
     ]
 
     def _check_refusal(self, response_content: str) -> bool:
@@ -240,20 +247,19 @@ class TestResponseQuality:
         response = test_agent.run(query)
         content = response.content if response.content else ""
 
-        judge_result = judge_response(
-            judge_client, query, content, "sheets,access,available"
-        )
+        judge_result = judge_response(judge_client, query, content, "sheets,access,available")
 
         evaluation = langwatch.evaluation.init("quality-navigation")
         evaluation.log(
             "response_quality",
             index=0,
             score=judge_result["score"] / 10.0,
-            data={"reasoning": judge_result["reasoning"]}
+            data={"reasoning": judge_result["reasoning"]},
         )
 
-        assert judge_result["score"] >= self.QUALITY_THRESHOLD, \
+        assert judge_result["score"] >= self.QUALITY_THRESHOLD, (
             f"Quality score {judge_result['score']}/10 below threshold. {judge_result['reasoning']}"
+        )
 
     def test_analytics_response_quality(self, test_agent, judge_client):
         """Analytics queries should receive quality responses."""
@@ -261,20 +267,19 @@ class TestResponseQuality:
         response = test_agent.run(query)
         content = response.content if response.content else ""
 
-        judge_result = judge_response(
-            judge_client, query, content, "status,breakdown,count"
-        )
+        judge_result = judge_response(judge_client, query, content, "status,breakdown,count")
 
         evaluation = langwatch.evaluation.init("quality-analytics")
         evaluation.log(
             "response_quality",
             index=0,
             score=judge_result["score"] / 10.0,
-            data={"reasoning": judge_result["reasoning"]}
+            data={"reasoning": judge_result["reasoning"]},
         )
 
-        assert judge_result["score"] >= self.QUALITY_THRESHOLD, \
+        assert judge_result["score"] >= self.QUALITY_THRESHOLD, (
             f"Quality score {judge_result['score']}/10 below threshold. {judge_result['reasoning']}"
+        )
 
 
 @pytest.mark.evaluation
@@ -311,8 +316,8 @@ def test_batch_tool_reliability(test_agent, test_dataset):
                 "query": row["query"],
                 "expected": row["expected_tool"],
                 "actual": tools,
-                "category": row["category"]
-            }
+                "category": row["category"],
+            },
         )
 
     pass_rate = passed / total * 100 if total > 0 else 0

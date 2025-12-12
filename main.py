@@ -48,6 +48,7 @@ from tenacity import (
 # Optional LangWatch integration - gracefully degrade if not installed
 try:
     import langwatch
+
     LANGWATCH_AVAILABLE = True
 except ImportError:
     LANGWATCH_AVAILABLE = False
@@ -82,6 +83,7 @@ def run_with_retry(agent: Agent, user_input: str, stream: bool = True) -> None:
     Uses exponential backoff: waits 1s, 2s, 4s between retries.
     Maximum 3 attempts before giving up.
     """
+
     @retry(
         retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
         stop=stop_after_attempt(3),
@@ -104,6 +106,7 @@ def run_with_retry(agent: Agent, user_input: str, stream: bool = True) -> None:
         print("   • API provider temporarily unavailable")
         print("   • Rate limiting")
         print("\n   Please try again in a moment.")
+
 
 # Initialize LangWatch for tracing and prompt management
 if LANGWATCH_AVAILABLE:
@@ -157,7 +160,7 @@ class SlashCommandCompleter(Completer):
         text = document.text_before_cursor
 
         # Only show completions if text starts with '/'
-        if text.startswith('/'):
+        if text.startswith("/"):
             for cmd, description in SLASH_COMMANDS.items():
                 if cmd.startswith(text):
                     yield Completion(
@@ -169,9 +172,11 @@ class SlashCommandCompleter(Completer):
 
 
 # Style for the prompt
-PROMPT_STYLE = Style.from_dict({
-    'prompt': 'ansicyan bold',
-})
+PROMPT_STYLE = Style.from_dict(
+    {
+        "prompt": "ansicyan bold",
+    }
+)
 
 # Ensure storage directory exists
 STORAGE_DIR = Path("tmp")
@@ -186,25 +191,47 @@ DEFAULT_MODEL = "google/gemini-2.5-flash"
 
 # Model routing configuration for efficiency
 MODEL_ROUTING = {
-    "fast": "google/gemini-2.0-flash-001",     # Simple queries, listing, basic lookups
-    "default": "google/gemini-2.5-flash",       # Most queries
-    "complex": "anthropic/claude-3-5-sonnet",   # Complex analysis, comparisons
+    "fast": "google/gemini-2.0-flash-001",  # Simple queries, listing, basic lookups
+    "default": "google/gemini-2.5-flash",  # Most queries
+    "complex": "anthropic/claude-3-5-sonnet",  # Complex analysis, comparisons
 }
 
 # Query patterns for smart routing
 SIMPLE_QUERY_PATTERNS = [
-    "list sheets", "show sheets", "what sheets", "available sheets",
-    "list reports", "show reports", "what reports",
-    "list workspaces", "show workspaces",
-    "help", "what can you do", "commands", "how to",
-    "/sheets", "/reports", "/help",
+    "list sheets",
+    "show sheets",
+    "what sheets",
+    "available sheets",
+    "list reports",
+    "show reports",
+    "what reports",
+    "list workspaces",
+    "show workspaces",
+    "help",
+    "what can you do",
+    "commands",
+    "how to",
+    "/sheets",
+    "/reports",
+    "/help",
 ]
 
 COMPLEX_QUERY_PATTERNS = [
-    "analyze", "compare", "summarize all", "trend", "pattern",
-    "explain why", "what caused", "relationship between",
-    "forecast", "predict", "correlation", "insights",
-    "comprehensive", "detailed analysis", "breakdown of all",
+    "analyze",
+    "compare",
+    "summarize all",
+    "trend",
+    "pattern",
+    "explain why",
+    "what caused",
+    "relationship between",
+    "forecast",
+    "predict",
+    "correlation",
+    "insights",
+    "comprehensive",
+    "detailed analysis",
+    "breakdown of all",
 ]
 
 
@@ -307,9 +334,9 @@ def create_agent(user_id: str = None, session_id: str = None, model_id: str = No
         session_id=session_id,
         # Conversation history - OPTIMIZED: reduced from 10 to 5 for efficiency
         add_history_to_context=True,  # Include conversation history in prompts
-        num_history_runs=5,           # Remember last 5 conversation exchanges (reduced from 10)
+        num_history_runs=5,  # Remember last 5 conversation exchanges (reduced from 10)
         # Persistent memory features
-        enable_user_memories=True,    # Remember facts about the user
+        enable_user_memories=True,  # Remember facts about the user
         enable_session_summaries=True,  # Summarize sessions for context
     )
 
@@ -344,7 +371,9 @@ def check_environment() -> bool:
     if not os.getenv("SMARTSHEET_ACCESS_TOKEN"):
         missing.append("SMARTSHEET_ACCESS_TOKEN")
         print("Error: SMARTSHEET_ACCESS_TOKEN environment variable is not set.")
-        print("Get your token from: https://app.smartsheet.com/b/home (Account > Personal Settings > API Access)")
+        print(
+            "Get your token from: https://app.smartsheet.com/b/home (Account > Personal Settings > API Access)"
+        )
 
     return len(missing) == 0
 
@@ -356,9 +385,9 @@ def _run_agent_impl(user_prompt: str) -> None:
 
     model_id = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Smartsheet Agent")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Model: {model_id}")
     print(f"\nQuery: {user_prompt}\n")
     print("-" * 60)
@@ -374,6 +403,7 @@ def run_agent(user_prompt: str) -> None:
         @langwatch.trace(name="smartsheet_agent_query")
         def traced_run():
             _run_agent_impl(user_prompt)
+
         traced_run()
     else:
         _run_agent_impl(user_prompt)
@@ -425,15 +455,15 @@ def interactive_mode() -> None:
 
             # ── Slash Command Handling ──────────────────────────────────
 
-            if user_input.lower() in ('/quit', '/exit', 'quit', 'exit', 'q'):
+            if user_input.lower() in ("/quit", "/exit", "quit", "exit", "q"):
                 print("\n👋 Goodbye!")
                 break
 
-            if user_input.lower() == '/help':
+            if user_input.lower() == "/help":
                 show_help()
                 continue
 
-            if user_input.lower().startswith('/model '):
+            if user_input.lower().startswith("/model "):
                 new_model = user_input[7:].strip()
                 if not new_model:
                     print("\n⚠️  Usage: /model <model_name>")
@@ -444,20 +474,22 @@ def interactive_mode() -> None:
                 print(f"\n✅ Switched to model: {new_model}")
                 continue
 
-            if user_input.lower() == '/clear':
-                agent = create_agent(user_id=user_id)  # Create fresh agent with new session but same user
+            if user_input.lower() == "/clear":
+                agent = create_agent(
+                    user_id=user_id
+                )  # Create fresh agent with new session but same user
                 print("\n✅ Conversation cleared. Starting fresh!")
                 print("   (Your memories are preserved. Use /forget to clear them.)")
                 continue
 
-            if user_input.lower() == '/history':
-                session_id = getattr(agent, 'session_id', None)
+            if user_input.lower() == "/history":
+                session_id = getattr(agent, "session_id", None)
                 print(f"\n📜 Session ID: {session_id or 'Not set'}")
                 print(f"   History runs: {agent.num_history_runs}")
                 print(f"   User ID: {user_id}")
                 continue
 
-            if user_input.lower() == '/memory':
+            if user_input.lower() == "/memory":
                 print("\n🧠 Agent Memories")
                 print("-" * 40)
                 try:
@@ -465,10 +497,10 @@ def interactive_mode() -> None:
                     if memories:
                         for i, mem in enumerate(memories, 1):
                             # Handle both dict and object formats
-                            if hasattr(mem, 'memory'):
+                            if hasattr(mem, "memory"):
                                 content = mem.memory
                             elif isinstance(mem, dict):
-                                content = mem.get('memory', mem.get('content', str(mem)))
+                                content = mem.get("memory", mem.get("content", str(mem)))
                             else:
                                 content = str(mem)
                             print(f"  {i}. {content}")
@@ -480,22 +512,22 @@ def interactive_mode() -> None:
                 print()
                 continue
 
-            if user_input.lower() == '/forget':
+            if user_input.lower() == "/forget":
                 print("\n⚠️  This will clear all memories about you.")
                 confirm = input("Are you sure? (yes/no): ").strip().lower()
-                if confirm == 'yes':
+                if confirm == "yes":
                     clear_user_memories(user_id)
                     print("✅ All memories cleared.")
                 else:
                     print("❌ Cancelled.")
                 continue
 
-            if user_input.lower() == '/refresh':
+            if user_input.lower() == "/refresh":
                 clear_smartsheet_cache()
                 print("\n✅ Smartsheet cache cleared. Next request will fetch fresh data.")
                 continue
 
-            if user_input.lower() == '/cache':
+            if user_input.lower() == "/cache":
                 stats = get_cache_stats()
                 print("\n📊 Cache Statistics")
                 print("-" * 40)
@@ -504,35 +536,40 @@ def interactive_mode() -> None:
                 print("\n💡 Use /refresh to clear cache and fetch fresh data.")
                 continue
 
-            if user_input.lower() == '/sheets':
+            if user_input.lower() == "/sheets":
                 print("\n📋 Fetching available sheets...")
                 run_with_retry(agent, "List all available Smartsheets")
                 continue
 
-            if user_input.lower() == '/reports':
+            if user_input.lower() == "/reports":
                 print("\n📊 Fetching available reports...")
                 run_with_retry(agent, "List all available Smartsheet reports")
                 continue
 
-            if user_input.lower().startswith('/summary '):
+            if user_input.lower().startswith("/summary "):
                 sheet_name = user_input[9:].strip()
                 if not sheet_name:
                     print("\n⚠️  Usage: /summary <sheet_name>")
                     continue
                 print(f"\n📊 Getting summary for '{sheet_name}'...")
-                run_with_retry(agent, f"Get a detailed summary and statistics for the sheet named '{sheet_name}'")
+                run_with_retry(
+                    agent,
+                    f"Get a detailed summary and statistics for the sheet named '{sheet_name}'",
+                )
                 continue
 
-            if user_input.lower().startswith('/columns '):
+            if user_input.lower().startswith("/columns "):
                 sheet_name = user_input[9:].strip()
                 if not sheet_name:
                     print("\n⚠️  Usage: /columns <sheet_name>")
                     continue
                 print(f"\n📋 Getting columns for '{sheet_name}'...")
-                run_with_retry(agent, f"Get detailed column metadata for the sheet named '{sheet_name}'")
+                run_with_retry(
+                    agent, f"Get detailed column metadata for the sheet named '{sheet_name}'"
+                )
                 continue
 
-            if user_input.lower().startswith('/search '):
+            if user_input.lower().startswith("/search "):
                 query = user_input[8:].strip()
                 if not query:
                     print("\n⚠️  Usage: /search <keyword>")
@@ -542,7 +579,7 @@ def interactive_mode() -> None:
                 continue
 
             # Unknown slash command
-            if user_input.startswith('/'):
+            if user_input.startswith("/"):
                 print(f"\n⚠️  Unknown command: {user_input.split()[0]}")
                 print("   Type '/help' to see available commands.")
                 continue
