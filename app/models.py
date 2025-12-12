@@ -8,7 +8,7 @@ These models define the schema for agent responses, enabling:
 - Consistent response formats
 """
 
-from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -36,7 +36,7 @@ class SearchResult(BaseModel):
     sheet_id: int = Field(..., description="ID of the sheet")
     row_number: int = Field(..., description="Row number where match was found")
     matched_text: str = Field(..., description="The text that matched the search")
-    context: Optional[str] = Field(None, description="Surrounding context")
+    context: str | None = Field(None, description="Surrounding context")
 
 
 class RowData(BaseModel):
@@ -57,10 +57,10 @@ class AgentResponse(BaseModel):
     """Standard response from the Smartsheet Agent."""
     success: bool = Field(..., description="Whether the query was successful")
     message: str = Field(..., description="Human-readable response message")
-    data_type: Optional[str] = Field(None, description="Type of data returned (sheet, search, summary, etc.)")
-    sheets: Optional[list[SheetInfo]] = Field(None, description="List of sheets if applicable")
-    summary: Optional[SheetSummary] = Field(None, description="Sheet summary if applicable")
-    search_results: Optional[list[SearchResult]] = Field(None, description="Search results if applicable")
-    rows: Optional[list[RowData]] = Field(None, description="Row data if applicable")
-    status_breakdown: Optional[StatusBreakdown] = Field(None, description="Status breakdown if applicable")
-    error: Optional[str] = Field(None, description="Error message if unsuccessful")
+    data_type: str | None = Field(None, description="Type of data returned (sheet, search, summary, etc.)")
+    sheets: list[SheetInfo] | None = Field(None, description="List of sheets if applicable")
+    summary: SheetSummary | None = Field(None, description="Sheet summary if applicable")
+    search_results: list[SearchResult] | None = Field(None, description="Search results if applicable")
+    rows: list[RowData] | None = Field(None, description="Row data if applicable")
+    status_breakdown: StatusBreakdown | None = Field(None, description="Status breakdown if applicable")
+    error: str | None = Field(None, description="Error message if unsuccessful")

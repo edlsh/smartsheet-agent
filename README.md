@@ -7,7 +7,7 @@ An AI-powered **read-only** agent for querying and analyzing Smartsheet data. As
 - **Read-Only by Design** - Safe data access with no modification capabilities
 - **Model Agnostic** - Use any LLM provider via OpenRouter (Claude, GPT-4, Gemini, Llama, etc.)
 - **Natural Language Queries** - Ask questions about your Smartsheet data conversationally
-- **49 Powerful Tools** - Comprehensive read-only access to sheets, reports, attachments, discussions, dashboards, automation, webhooks, images, and more
+- **31 Powerful Tools** - Comprehensive read-only access to sheets, reports, attachments, discussions, dashboards, webhooks, images, and more
 - **Interactive Mode** - Chat with your data in a conversational session
 - **Easy Model Switching** - Change models on-the-fly during interactive sessions
 - **Cell History Audit** - Track who changed what and when
@@ -147,115 +147,77 @@ uv run python main.py "Search for tasks assigned to John"
 
 ## Available Tools
 
-All tools are **read-only** - no data can be created, modified, or deleted.
+All tools are **read-only** - no data can be created, modified, or deleted. Tools are consolidated for efficiency.
 
-### Core Tools
+### Core Tools (5)
 
 | Tool | Description |
 |------|-------------|
 | `list_sheets` | List all Smartsheets accessible to your account |
 | `get_sheet` | Get detailed data from a specific sheet (by ID or name) |
 | `get_row` | Get information about a specific row |
-| `search_sheets` | Search across all sheets for specific text |
-| `search_sheet` | Search within a specific sheet for text |
-
-### Analysis Tools
-
-| Tool | Description |
-|------|-------------|
-| `get_columns` | Get detailed column metadata (types, options, formulas) |
-| `get_sheet_summary` | Get statistics: row counts, fill rates, column types |
 | `filter_rows` | Filter rows by column values (contains, equals, starts_with, ends_with) |
-| `get_sheet_by_column` | Get only specific columns from a sheet (useful for large sheets) |
 | `count_rows_by_column` | Count rows grouped by column values (useful for status breakdowns) |
-| `get_summary_fields` | Get sheet summary fields (KPIs/metadata at sheet level) |
 
-### Audit Tools
+### Fuzzy Search Tools (2)
 
 | Tool | Description |
 |------|-------------|
-| `get_cell_history` | Get revision history for a specific cell (who changed what, when) |
+| `find_sheets` | Search for sheets by partial or approximate name |
+| `find_columns` | Search for columns in a sheet by partial name |
+
+### Smart Analysis (1)
+
+| Tool | Description |
+|------|-------------|
+| `analyze_sheet` | Perform multiple analysis operations in a single efficient call (summary, columns, stats, filter, count, sample) |
+
+### Unified Resource Tools (7)
+
+| Tool | Description |
+|------|-------------|
+| `workspace` | List workspaces or get workspace details (action: list/get) |
+| `folder` | List folders or get folder contents (action: list/get) |
+| `sight` | List dashboards or get dashboard details (action: list/get) |
+| `report` | List reports or get report data (action: list/get) |
+| `webhook` | List webhooks or get webhook details (action: list/get) |
+| `group` | List groups or get group members (action: list/get) |
+| `user` | List org users or get user profile (action: list/get) |
+
+### Unified Scope Tools (2)
+
+| Tool | Description |
+|------|-------------|
+| `attachment` | Get attachments for a sheet or row (scope: sheet/row) |
+| `discussion` | Get discussions for a sheet or row (scope: sheet/row) |
+
+### Navigation & Metadata (4)
+
+| Tool | Description |
+|------|-------------|
+| `search` | Search across all sheets or within a specific sheet |
+| `navigation` | Get home overview, favorites, or templates |
+| `sheet_metadata` | Get columns, summary fields, shares, publish status, or automation rules |
+| `sheet_info` | Get proofs or cross-sheet references for a sheet |
+
+### Update Requests (1)
+
+| Tool | Description |
+|------|-------------|
+| `update_requests` | List update requests (action: list/sent) |
+
+### Standalone Tools (9)
+
+| Tool | Description |
+|------|-------------|
+| `compare_sheets` | Compare two sheets by a key column to find differences |
+| `get_cell_history` | Get revision history for a specific cell |
 | `get_sheet_version` | Get sheet version and modification info |
 | `get_events` | Get recent events/audit log (Enterprise feature) |
-
-### Reports
-
-| Tool | Description |
-|------|-------------|
-| `get_reports` | List all available Smartsheet reports |
-| `get_report` | Get data from a specific report |
-
-### Attachments & Discussions
-
-| Tool | Description |
-|------|-------------|
-| `get_row_attachments` | Get all attachments for a specific row |
-| `get_sheet_attachments` | Get all attachments in a sheet |
-| `get_attachment` | Get attachment details with download URL |
-| `get_row_discussions` | Get discussions/comments for a specific row |
-| `get_sheet_discussions` | Get all discussions/comments in a sheet |
-
-### Organization
-
-| Tool | Description |
-|------|-------------|
-| `get_workspaces` | List all workspaces |
-| `get_workspace` | Get workspace details including sheets, folders, reports |
-| `get_folders` | List home-level folders |
-| `get_folder` | Get folder details and contents |
-| `get_home` | Get overview of user's Smartsheet home (all root-level content) |
-| `get_favorites` | Get user's favorite/starred items |
-| `get_templates` | List all available templates (public and user) |
-
-### Sights (Dashboards)
-
-| Tool | Description |
-|------|-------------|
-| `get_sights` | List all Sights (dashboards) |
-| `get_sight` | Get Sight details and widgets |
-
-### Advanced
-
-| Tool | Description |
-|------|-------------|
 | `get_current_user` | Get current authenticated user profile |
-| `get_cross_sheet_references` | Get cross-sheet references in a sheet |
-| `compare_sheets` | Compare two sheets by a key column to find differences |
-
-### Automation & Admin
-
-| Tool | Description |
-|------|-------------|
-| `get_automation_rules` | List automation rules for a sheet |
-| `get_groups` | List all groups in the organization |
-| `get_group` | Get group details and members |
 | `get_contacts` | List personal contacts |
-| `get_sheet_shares` | Get sharing info for a sheet (who has access) |
-| `list_users` | List all users in the organization (Admin feature) |
-| `get_user` | Get detailed user profile by ID or email (Admin feature) |
-| `list_org_sheets` | List ALL sheets in the organization (Admin feature) |
-
-### Publishing & Requests
-
-| Tool | Description |
-|------|-------------|
 | `get_server_info` | Get Smartsheet server info and constants |
-| `get_sheet_publish_status` | Get sheet publish status and URLs |
-| `get_proofs` | List proofs in a sheet |
-| `get_update_requests` | List update requests for a sheet |
-| `get_sent_update_requests` | List sent update requests |
-
-### Webhooks
-
-| Tool | Description |
-|------|-------------|
-| `list_webhooks` | List all webhooks owned by the user |
-| `get_webhook` | Get detailed webhook information and statistics |
-
-### Images
-
-| Tool | Description |
-|------|-------------|
+| `list_org_sheets` | List ALL sheets in the organization (Admin feature) |
 | `get_image_urls` | Get temporary download URL for cell images |
 
 ## Configuration

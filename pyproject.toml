@@ -3,7 +3,27 @@ name = "smartsheet-agent"
 version = "0.2.0"
 description = "AI agent for querying Smartsheet data - jobs, status updates, KPIs, and metrics. Built with Agno framework and supports multiple LLM providers via OpenRouter."
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Enzo Lucchesi", email = "enzo@lucchesi.dev"}
+]
+maintainers = [
+    {name = "Enzo Lucchesi", email = "enzo@lucchesi.dev"}
+]
+keywords = ["smartsheet", "ai", "agent", "llm", "openrouter", "agno"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business",
+]
 dependencies = [
     "agno>=1.0.0",
     "openai>=1.0.0",
@@ -11,7 +31,16 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "prompt_toolkit>=3.0.0",
     "sqlalchemy>=2.0.0",
+    "tenacity>=8.0.0",
+    "httpx>=0.24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/enzolucchesi/smartsheet-agent"
+Repository = "https://github.com/enzolucchesi/smartsheet-agent"
+Documentation = "https://github.com/enzolucchesi/smartsheet-agent#readme"
+Issues = "https://github.com/enzolucchesi/smartsheet-agent/issues"
+Changelog = "https://github.com/enzolucchesi/smartsheet-agent/blob/main/CHANGELOG.md"
 
 [project.scripts]
 smartsheet-agent = "main:main"
@@ -19,9 +48,13 @@ smartsheet-agent = "main:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
     "ruff>=0.1.0",
     "pandas>=2.0.0",
     "jupyter>=1.0.0",
+]
+tracing = [
+    "langwatch>=0.7.1",
 ]
 
 [dependency-groups]
@@ -30,4 +63,31 @@ dev = [
     "langwatch-scenario>=0.7.14",
     "pytest-asyncio>=1.3.0",
     "pandas>=2.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["main.py", "smartsheet_tools.py", "workflows.py", "app/"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["main.py", "smartsheet_tools.py", "workflows.py", "app/", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["E501", "E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "agent_test: mark test as an agent scenario test (requires API keys)",
 ]

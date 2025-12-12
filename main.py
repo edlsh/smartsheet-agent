@@ -20,37 +20,46 @@ Supports multiple LLM providers via OpenRouter:
 - And many more!
 """
 
-import os
 import getpass
 import hashlib
+import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # Load environment variables FIRST before any other imports that need them
 load_dotenv()
 
+import httpx
 from agno.agent import Agent
-from agno.models.openrouter import OpenRouter
 from agno.db.sqlite import SqliteDb
 from agno.exceptions import ModelProviderError
+from agno.models.openrouter import OpenRouter
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.styles import Style
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
-import httpx
-import langwatch
 
-from smartsheet_tools_optimized import (
-    SMARTSHEET_TOOLS, 
-    clear_cache as clear_smartsheet_cache,
+# Optional LangWatch integration - gracefully degrade if not installed
+try:
+    import langwatch
+    LANGWATCH_AVAILABLE = True
+except ImportError:
+    LANGWATCH_AVAILABLE = False
+    langwatch = None
+
+from smartsheet_tools import (
+    SMARTSHEET_TOOLS,
     get_cache_stats,
 )
-
+from smartsheet_tools import (
+    clear_cache as clear_smartsheet_cache,
+)
 
 # ============================================================================
 # Retry Configuration for Transient Network Errors
@@ -69,7 +78,7 @@ RETRYABLE_EXCEPTIONS = (
 def run_with_retry(agent: Agent, user_input: str, stream: bool = True) -> None:
     """
     Run agent with automatic retry for transient network errors.
-    
+
     Uses exponential backoff: waits 1s, 2s, 4s between retries.
     Maximum 3 attempts before giving up.
     """
@@ -85,7 +94,7 @@ def run_with_retry(agent: Agent, user_input: str, stream: bool = True) -> None:
     )
     def _run():
         agent.print_response(user_input, stream=stream)
-    
+
     try:
         _run()
     except RETRYABLE_EXCEPTIONS as e:
@@ -97,24 +106,25 @@ def run_with_retry(agent: Agent, user_input: str, stream: bool = True) -> None:
         print("\n   Please try again in a moment.")
 
 # Initialize LangWatch for tracing and prompt management
-langwatch.setup()
+if LANGWATCH_AVAILABLE:
+    langwatch.setup()
 
 
 def get_user_id() -> str:
     """
     Get a stable user identifier for memory personalization.
-    
+
     Uses the system username combined with machine info to create
     a consistent but privacy-preserving user ID.
     """
     # Get system username
     username = getpass.getuser()
-    
+
     # Create a hash-based ID for privacy (doesn't expose actual username)
     # but is consistent across sessions on the same machine
     machine_id = f"{username}@{os.uname().nodename}"
     user_hash = hashlib.sha256(machine_id.encode()).hexdigest()[:16]
-    
+
     return f"user_{user_hash}"
 
 
@@ -142,10 +152,10 @@ SLASH_COMMANDS = {
 
 class SlashCommandCompleter(Completer):
     """Autocomplete for slash commands."""
-    
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
-        
+
         # Only show completions if text starts with '/'
         if text.startswith('/'):
             for cmd, description in SLASH_COMMANDS.items():
@@ -201,40 +211,63 @@ COMPLEX_QUERY_PATTERNS = [
 def get_routed_model(query: str) -> str:
     """
     Route queries to appropriate models based on complexity.
-    
+
     Simple queries -> Fast model (lower cost, lower latency)
     Complex queries -> Capable model (better reasoning)
     Default -> Balanced model
     """
     query_lower = query.lower().strip()
-    
+
     # Check for explicit model override
     env_model = os.getenv("OPENROUTER_MODEL")
     if env_model:
         return env_model
-    
+
     # Check for simple patterns -> use fast model
     for pattern in SIMPLE_QUERY_PATTERNS:
         if pattern in query_lower:
             return MODEL_ROUTING["fast"]
-    
+
     # Check for complex patterns -> use capable model
     for pattern in COMPLEX_QUERY_PATTERNS:
         if pattern in query_lower:
             return MODEL_ROUTING["complex"]
-    
+
     # Default model
     return MODEL_ROUTING["default"]
 
 
 def get_system_prompt() -> str:
-    """Get the system prompt from LangWatch prompt management."""
-    prompt = langwatch.prompts.get("smartsheet-agent")
-    # Extract the system message content from the prompt
-    for message in prompt.messages:
-        if message.get("role") == "system":
-            return message.get("content", "")
-    return ""
+    """Get the system prompt from LangWatch prompt management or fallback."""
+    if LANGWATCH_AVAILABLE:
+        try:
+            prompt = langwatch.prompts.get("smartsheet-agent")
+            # Extract the system message content from the prompt
+            for message in prompt.messages:
+                if message.get("role") == "system":
+                    return message.get("content", "")
+        except Exception:
+            pass  # Fall through to default prompt
+
+    # Default system prompt when LangWatch is not available
+    return """You are a Smartsheet data assistant with READ-ONLY access to Smartsheet data.
+
+Your capabilities:
+- List and search sheets, reports, dashboards, and workspaces
+- Query and filter data from sheets
+- Analyze metrics and generate summaries
+- View cell history and audit information
+- Access attachments, discussions, and sharing info
+
+Important guidelines:
+- You can only READ data - no modifications are possible
+- Always use the appropriate tool for the task
+- When users ask about sheets by partial name, use find_sheets() first
+- When users ask about columns by partial name, use find_columns() first
+- For complex analysis, prefer analyze_sheet() to minimize API calls
+- Present data clearly and concisely
+
+Be helpful, accurate, and efficient in answering questions about Smartsheet data."""
 
 
 def get_model() -> OpenRouter:
@@ -250,18 +283,18 @@ _db = SqliteDb(db_file=DB_FILE)
 def create_agent(user_id: str = None, session_id: str = None, model_id: str = None) -> Agent:
     """
     Create and configure the Smartsheet Agent with conversation memory.
-    
+
     Args:
         user_id: Unique user identifier for personalized memory
         session_id: Session ID for conversation continuity
         model_id: Optional model override (for smart routing)
-    
+
     Returns:
         Configured Agent with persistent memory enabled
     """
     # Use provided model or default
     model = OpenRouter(id=model_id) if model_id else get_model()
-    
+
     return Agent(
         name="Smartsheet Agent",
         model=model,
@@ -302,23 +335,22 @@ def clear_user_memories(user_id: str) -> None:
 def check_environment() -> bool:
     """Verify required environment variables are set."""
     missing = []
-    
+
     if not os.getenv("OPENROUTER_API_KEY"):
         missing.append("OPENROUTER_API_KEY")
         print("Error: OPENROUTER_API_KEY environment variable is not set.")
         print("Get your API key from: https://openrouter.ai/settings/keys")
-    
+
     if not os.getenv("SMARTSHEET_ACCESS_TOKEN"):
         missing.append("SMARTSHEET_ACCESS_TOKEN")
         print("Error: SMARTSHEET_ACCESS_TOKEN environment variable is not set.")
         print("Get your token from: https://app.smartsheet.com/b/home (Account > Personal Settings > API Access)")
-    
+
     return len(missing) == 0
 
 
-@langwatch.trace(name="smartsheet_agent_query")
-def run_agent(user_prompt: str) -> None:
-    """Run the Smartsheet Agent with the given prompt."""
+def _run_agent_impl(user_prompt: str) -> None:
+    """Internal implementation of run_agent."""
     if not check_environment():
         return
 
@@ -333,6 +365,18 @@ def run_agent(user_prompt: str) -> None:
 
     agent = create_agent()
     run_with_retry(agent, user_prompt, stream=True)
+
+
+def run_agent(user_prompt: str) -> None:
+    """Run the Smartsheet Agent with the given prompt."""
+    if LANGWATCH_AVAILABLE:
+        # Use LangWatch tracing when available
+        @langwatch.trace(name="smartsheet_agent_query")
+        def traced_run():
+            _run_agent_impl(user_prompt)
+        traced_run()
+    else:
+        _run_agent_impl(user_prompt)
 
 
 def show_help() -> None:
@@ -350,16 +394,16 @@ def interactive_mode() -> None:
     """Run the agent in interactive mode with slash command autocomplete."""
     if not check_environment():
         return
-    
+
     # Get stable user ID for memory personalization
     user_id = get_user_id()
     model_id = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    
+
     print("\n" + "=" * 60)
     print("🤖 Smartsheet Agent - Interactive Mode")
     print("=" * 60)
     print(f"📊 Model: {model_id}")
-    print(f"🧠 Memory: Enabled (your preferences will be remembered)")
+    print("🧠 Memory: Enabled (your preferences will be remembered)")
     print("\nAsk questions about your Smartsheet data.")
     print("Type '/' for command autocomplete, or '/help' for all commands.\n")
 
@@ -380,15 +424,15 @@ def interactive_mode() -> None:
                 continue
 
             # ── Slash Command Handling ──────────────────────────────────
-            
+
             if user_input.lower() in ('/quit', '/exit', 'quit', 'exit', 'q'):
                 print("\n👋 Goodbye!")
                 break
-            
+
             if user_input.lower() == '/help':
                 show_help()
                 continue
-            
+
             if user_input.lower().startswith('/model '):
                 new_model = user_input[7:].strip()
                 if not new_model:
@@ -399,20 +443,20 @@ def interactive_mode() -> None:
                 agent = create_agent(user_id=user_id)  # Preserve user_id for memory continuity
                 print(f"\n✅ Switched to model: {new_model}")
                 continue
-            
+
             if user_input.lower() == '/clear':
                 agent = create_agent(user_id=user_id)  # Create fresh agent with new session but same user
                 print("\n✅ Conversation cleared. Starting fresh!")
                 print("   (Your memories are preserved. Use /forget to clear them.)")
                 continue
-            
+
             if user_input.lower() == '/history':
                 session_id = getattr(agent, 'session_id', None)
                 print(f"\n📜 Session ID: {session_id or 'Not set'}")
                 print(f"   History runs: {agent.num_history_runs}")
                 print(f"   User ID: {user_id}")
                 continue
-            
+
             if user_input.lower() == '/memory':
                 print("\n🧠 Agent Memories")
                 print("-" * 40)
@@ -435,7 +479,7 @@ def interactive_mode() -> None:
                     print(f"  Could not retrieve memories: {e}")
                 print()
                 continue
-            
+
             if user_input.lower() == '/forget':
                 print("\n⚠️  This will clear all memories about you.")
                 confirm = input("Are you sure? (yes/no): ").strip().lower()
@@ -445,12 +489,12 @@ def interactive_mode() -> None:
                 else:
                     print("❌ Cancelled.")
                 continue
-            
+
             if user_input.lower() == '/refresh':
                 clear_smartsheet_cache()
                 print("\n✅ Smartsheet cache cleared. Next request will fetch fresh data.")
                 continue
-            
+
             if user_input.lower() == '/cache':
                 stats = get_cache_stats()
                 print("\n📊 Cache Statistics")
@@ -459,7 +503,7 @@ def interactive_mode() -> None:
                 print(f"  L2 (Disk):   {stats['l2_entries']} entries")
                 print("\n💡 Use /refresh to clear cache and fetch fresh data.")
                 continue
-            
+
             if user_input.lower() == '/sheets':
                 print("\n📋 Fetching available sheets...")
                 run_with_retry(agent, "List all available Smartsheets")
@@ -504,11 +548,11 @@ def interactive_mode() -> None:
                 continue
 
             # ── Regular Query with Smart Routing ───────────────────────
-            
+
             # Get optimal model for this query
             routed_model = get_routed_model(user_input)
             current_model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-            
+
             # If routing suggests a different model, create a new agent for this query
             if routed_model != current_model and not os.getenv("OPENROUTER_MODEL"):
                 # Create temporary agent with routed model

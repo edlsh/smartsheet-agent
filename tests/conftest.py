@@ -3,6 +3,7 @@ Pytest configuration for Smartsheet Agent tests.
 """
 
 import os
+
 import pytest
 from dotenv import load_dotenv
 

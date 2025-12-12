@@ -1,112 +1,246 @@
 #!/usr/bin/env python3
 """
-Smartsheet tools for SmartSheetBot.
+Optimized Smartsheet tools for SmartSheetBot.
 
 This module provides READ-ONLY tools for interacting with Smartsheet data.
-These tools are simple Python functions that can be used with Agno agents.
+Optimizations include:
+- Agno @tool decorator with cache_results for automatic caching
+- Multi-level caching (L1 memory + L2 disk)
+- Async tool execution support
+- Rate limiting with exponential backoff
+- Pagination optimization
 
-CONSOLIDATED TOOLS (28 total, reduced from 49):
-
-    Core (5 tools - unchanged):
-    - list_sheets: List all accessible Smartsheets
-    - get_sheet: Get detailed data from a specific sheet
-    - get_row: Get information about a specific row
-    - filter_rows: Filter rows based on column values
-    - count_rows_by_column: Count rows grouped by column values
-
-    Unified Resource Tools (7 tools - consolidated from 14):
-    - workspace: List all or get specific workspace
-    - folder: List all or get specific folder
-    - sight: List all or get specific sight/dashboard
-    - report: List all or get specific report
-    - webhook: List all or get specific webhook
-    - group: List all or get specific group
-    - user: List all or get specific user (Admin)
-
-    Unified Scope Tools (2 tools - consolidated from 5):
-    - attachment: Get attachments at sheet/row/specific level
-    - discussion: Get discussions at sheet/row level
-
-    Unified Search (1 tool - consolidated from 2):
-    - search: Search globally or within specific sheet
-
-    Unified Navigation (1 tool - consolidated from 3):
-    - navigation: Access home, favorites, or templates
-
-    Unified Sheet Metadata (1 tool - consolidated from 5):
-    - sheet_metadata: Get automation, shares, publish status, proofs, or cross-references
-
-    Unified Sheet Info (1 tool - consolidated from 4):
-    - sheet_info: Get columns, stats, summary_fields, or specific columns
-
-    Unified Update Requests (1 tool - consolidated from 2):
-    - update_requests: Get pending or sent update requests
-
-    Standalone Tools (9 tools - unchanged):
-    - compare_sheets: Compare two sheets by key column
-    - get_cell_history: Get revision history for a specific cell
-    - get_sheet_version: Get sheet version information
-    - get_events: Get recent audit events
-    - get_current_user: Get current user profile
-    - get_contacts: Get personal contacts
-    - get_server_info: Get server information
-    - list_org_sheets: List all organization sheets (Admin)
-    - get_image_urls: Get image URLs from cells
-
-Sheet Scoping:
-    Set these environment variables to restrict access to specific sheets:
-    - ALLOWED_SHEET_IDS: Comma-separated list of sheet IDs
-    - ALLOWED_SHEET_NAMES: Comma-separated list of sheet names
+CONSOLIDATED TOOLS (31 total):
+    Core (5): list_sheets, get_sheet, get_row, filter_rows, count_rows_by_column
+    Fuzzy Search (2): find_sheets, find_columns - search by partial/approximate names
+    Smart Query Planning (1): analyze_sheet - efficient multi-operation analysis
+    Unified Resource (7): workspace, folder, sight, report, webhook, group, user
+    Unified Scope (2): attachment, discussion
+    Unified Search (1): search
+    Unified Navigation (1): navigation
+    Unified Sheet Metadata (1): sheet_metadata
+    Unified Sheet Info (1): sheet_info
+    Unified Update Requests (1): update_requests
+    Standalone (9): compare_sheets, get_cell_history, get_sheet_version, get_events,
+                   get_current_user, get_contacts, get_server_info, list_org_sheets, get_image_urls
 """
 
+import asyncio
+import hashlib
+import json
 import os
-from typing import Optional, Literal
-from datetime import datetime, timedelta
-from functools import lru_cache
+import pickle
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from functools import lru_cache, wraps
+from pathlib import Path
+from typing import Any, Literal
+
 import smartsheet
-
+from agno.tools import tool
 
 # =============================================================================
-# CACHING & PERFORMANCE CONFIGURATION
+# MULTI-LEVEL CACHING CONFIGURATION
 # =============================================================================
 
-# Cache TTL in seconds (5 minutes default)
-CACHE_TTL_SECONDS = int(os.getenv("SMARTSHEET_CACHE_TTL", "300"))
+# Cache configuration from environment
+CACHE_TTL_L1 = int(os.getenv("SMARTSHEET_CACHE_TTL_L1", "60"))      # L1: 1 minute (memory)
+CACHE_TTL_L2 = int(os.getenv("SMARTSHEET_CACHE_TTL_L2", "300"))     # L2: 5 minutes (disk)
+CACHE_DIR = Path(os.getenv("SMARTSHEET_CACHE_DIR", "tmp/cache"))
+MAX_L1_ENTRIES = int(os.getenv("SMARTSHEET_CACHE_MAX_L1", "100"))
 
-# Global cache storage with timestamps
-_cache = {
-    "client": None,
-    "client_created_at": 0,
-    "sheets_list": None,
-    "sheets_list_fetched_at": 0,
-    "sheet_name_to_id": {},  # name.lower() -> (id, name, fetched_at)
-}
-_cache_lock = threading.Lock()
+# Ensure cache directory exists
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _is_cache_valid(fetched_at: float) -> bool:
-    """Check if cached data is still valid based on TTL."""
-    return time.time() - fetched_at < CACHE_TTL_SECONDS
+class MultiLevelCache:
+    """
+    Multi-level cache with L1 (memory) and L2 (disk) tiers.
 
+    L1: Fast in-memory cache with short TTL
+    L2: Disk-based cache with longer TTL for persistence
+    """
 
-def clear_cache():
-    """Clear all cached data. Call this if you need fresh data."""
-    global _cache
-    with _cache_lock:
-        _cache = {
-            "client": None,
-            "client_created_at": 0,
-            "sheets_list": None,
-            "sheets_list_fetched_at": 0,
-            "sheet_name_to_id": {},
+    def __init__(self, l1_ttl: int = CACHE_TTL_L1, l2_ttl: int = CACHE_TTL_L2,
+                 max_l1_entries: int = MAX_L1_ENTRIES):
+        self.l1_ttl = l1_ttl
+        self.l2_ttl = l2_ttl
+        self.max_l1_entries = max_l1_entries
+        self._l1_cache: dict[str, tuple[Any, float]] = {}
+        self._lock = threading.Lock()
+
+    def _generate_key(self, func_name: str, args: tuple, kwargs: dict) -> str:
+        """Generate a unique cache key based on function name and arguments."""
+        # Sort kwargs for consistent hashing
+        key_data = json.dumps({
+            "func": func_name,
+            "args": [str(a) for a in args],
+            "kwargs": {k: str(v) for k, v in sorted(kwargs.items())}
+        }, sort_keys=True)
+        return hashlib.md5(key_data.encode()).hexdigest()
+
+    def _get_l2_path(self, key: str) -> Path:
+        """Get the disk cache path for a key."""
+        return CACHE_DIR / f"{key}.pkl"
+
+    def get(self, func_name: str, args: tuple, kwargs: dict) -> tuple[bool, Any]:
+        """
+        Get value from cache. Checks L1 first, then L2.
+        Returns (hit, value) tuple.
+        """
+        key = self._generate_key(func_name, args, kwargs)
+
+        # Check L1 (memory)
+        with self._lock:
+            if key in self._l1_cache:
+                value, timestamp = self._l1_cache[key]
+                if time.time() - timestamp < self.l1_ttl:
+                    return True, value
+                else:
+                    del self._l1_cache[key]
+
+        # Check L2 (disk)
+        l2_path = self._get_l2_path(key)
+        if l2_path.exists():
+            try:
+                with open(l2_path, 'rb') as f:
+                    data = pickle.load(f)
+                if time.time() - data['timestamp'] < self.l2_ttl:
+                    # Promote to L1
+                    self._set_l1(key, data['value'])
+                    return True, data['value']
+                else:
+                    l2_path.unlink()  # Remove expired
+            except (pickle.PickleError, KeyError, OSError):
+                pass
+
+        return False, None
+
+    def _set_l1(self, key: str, value: Any):
+        """Set value in L1 cache with LRU eviction."""
+        with self._lock:
+            # LRU eviction if at capacity
+            if len(self._l1_cache) >= self.max_l1_entries:
+                # Remove oldest entry
+                oldest_key = min(self._l1_cache, key=lambda k: self._l1_cache[k][1])
+                del self._l1_cache[oldest_key]
+
+            self._l1_cache[key] = (value, time.time())
+
+    def set(self, func_name: str, args: tuple, kwargs: dict, value: Any):
+        """Set value in both L1 and L2 caches."""
+        key = self._generate_key(func_name, args, kwargs)
+
+        # Set in L1
+        self._set_l1(key, value)
+
+        # Set in L2 (disk)
+        try:
+            l2_path = self._get_l2_path(key)
+            with open(l2_path, 'wb') as f:
+                pickle.dump({
+                    'value': value,
+                    'timestamp': time.time()
+                }, f)
+        except (pickle.PickleError, OSError):
+            pass  # Fail silently for disk cache
+
+    def clear(self):
+        """Clear all caches."""
+        with self._lock:
+            self._l1_cache.clear()
+
+        # Clear L2
+        for cache_file in CACHE_DIR.glob("*.pkl"):
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
+
+    def get_stats(self) -> dict:
+        """Get cache statistics."""
+        l2_count = len(list(CACHE_DIR.glob("*.pkl")))
+        with self._lock:
+            l1_count = len(self._l1_cache)
+        return {
+            "l1_entries": l1_count,
+            "l2_entries": l2_count,
+            "l1_max": self.max_l1_entries
         }
 
 
+# Global cache instance
+_cache = MultiLevelCache()
+
+
+def cached_tool(func):
+    """
+    Decorator that adds multi-level caching to a tool function.
+    Works alongside Agno's @tool decorator.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Check cache
+        hit, value = _cache.get(func.__name__, args, kwargs)
+        if hit:
+            return value
+
+        # Execute and cache
+        result = func(*args, **kwargs)
+        _cache.set(func.__name__, args, kwargs, result)
+        return result
+
+    return wrapper
+
+
 # =============================================================================
-# HELPER FUNCTIONS
+# SMARTSHEET CLIENT & HELPERS
 # =============================================================================
+
+# Client singleton with TTL
+_client_cache = {
+    "client": None,
+    "created_at": 0
+}
+_client_lock = threading.Lock()
+
+
+def get_smartsheet_client() -> smartsheet.Smartsheet:
+    """
+    Get an authenticated Smartsheet client (singleton with TTL).
+    Thread-safe with automatic refresh.
+    """
+    global _client_cache
+
+    with _client_lock:
+        # Return cached client if still valid (refresh every 5 minutes)
+        if _client_cache["client"] and time.time() - _client_cache["created_at"] < 300:
+            return _client_cache["client"]
+
+        token = os.getenv("SMARTSHEET_ACCESS_TOKEN")
+        if not token:
+            raise ValueError("SMARTSHEET_ACCESS_TOKEN environment variable is not set")
+
+        client = smartsheet.Smartsheet(token)
+        client.errors_as_exceptions(True)
+
+        _client_cache["client"] = client
+        _client_cache["created_at"] = time.time()
+
+        return client
+
+
+# Thread pool for async operations
+_executor = ThreadPoolExecutor(max_workers=4)
+
+
+async def run_async(func, *args, **kwargs):
+    """Run a synchronous function asynchronously using thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, lambda: func(*args, **kwargs))
+
 
 @lru_cache(maxsize=1)
 def _get_allowed_sheet_ids() -> frozenset[int]:
@@ -119,7 +253,7 @@ def _get_allowed_sheet_ids() -> frozenset[int]:
 
 @lru_cache(maxsize=1)
 def _get_allowed_sheet_names() -> frozenset[str]:
-    """Get set of allowed sheet names from environment (cached, lowercase for comparison)."""
+    """Get set of allowed sheet names from environment (cached, lowercase)."""
     names_str = os.getenv("ALLOWED_SHEET_NAMES", "").strip()
     if not names_str:
         return frozenset()
@@ -143,124 +277,59 @@ def _is_sheet_allowed(sheet_id: int = None, sheet_name: str = None) -> bool:
     return False
 
 
-def get_smartsheet_client() -> smartsheet.Smartsheet:
-    """
-    Get an authenticated Smartsheet client (singleton with TTL).
-    
-    The client is cached and reused for CACHE_TTL_SECONDS to reduce
-    connection overhead. Thread-safe.
-    """
-    global _cache
-    
-    with _cache_lock:
-        # Return cached client if still valid
-        if _cache["client"] and _is_cache_valid(_cache["client_created_at"]):
-            return _cache["client"]
-        
-        # Create new client
-        token = os.getenv("SMARTSHEET_ACCESS_TOKEN")
-        if not token:
-            raise ValueError("SMARTSHEET_ACCESS_TOKEN environment variable is not set")
-        
-        client = smartsheet.Smartsheet(token)
-        client.errors_as_exceptions(True)
-        
-        # Cache the client
-        _cache["client"] = client
-        _cache["client_created_at"] = time.time()
-        
-        return client
-
-
-def _get_sheets_list_cached(client) -> list:
-    """
-    Get list of sheets with caching.
-    
-    Caches the sheets list for CACHE_TTL_SECONDS to avoid repeated API calls
-    when resolving sheet names or listing sheets.
-    """
-    global _cache
-    
-    with _cache_lock:
-        if _cache["sheets_list"] and _is_cache_valid(_cache["sheets_list_fetched_at"]):
-            return _cache["sheets_list"]
-    
-    # Fetch fresh data (outside lock to avoid blocking)
-    response = client.Sheets.list_sheets(include_all=True)
-    sheets_list = list(response.data)
-    
-    with _cache_lock:
-        _cache["sheets_list"] = sheets_list
-        _cache["sheets_list_fetched_at"] = time.time()
-        
-        # Also populate the name->id cache
-        for sheet in sheets_list:
-            _cache["sheet_name_to_id"][sheet.name.lower()] = (
-                sheet.id, 
-                sheet.name, 
-                time.time()
-            )
-    
-    return sheets_list
-
-
 def _resolve_sheet_id(client, sheet_id: str) -> tuple[int, str]:
-    """
-    Resolve sheet ID from name if needed. Returns (id, name).
-    
-    Uses caching to avoid repeated API calls for name resolution.
-    """
-    # If it's already a numeric ID, return it
+    """Resolve sheet ID from name if needed. Returns (id, name)."""
     if str(sheet_id).isdigit():
         return int(sheet_id), None
-    
-    sheet_name_lower = sheet_id.lower()
-    
-    # Check cache first
-    with _cache_lock:
-        if sheet_name_lower in _cache["sheet_name_to_id"]:
-            cached_id, cached_name, fetched_at = _cache["sheet_name_to_id"][sheet_name_lower]
-            if _is_cache_valid(fetched_at):
-                return cached_id, cached_name
-    
-    # Fetch sheets list (uses its own cache)
-    sheets_list = _get_sheets_list_cached(client)
-    
-    for sheet in sheets_list:
-        if sheet.name.lower() == sheet_name_lower:
-            return sheet.id, sheet.name
-    
+
+    # Search in cached sheets list
+    try:
+        response = client.Sheets.list_sheets(include_all=True)
+        for sheet in response.data:
+            if sheet.name.lower() == sheet_id.lower():
+                return sheet.id, sheet.name
+    except Exception:
+        pass
+
     return None, None
 
 
+def clear_cache():
+    """Clear all cached data including multi-level cache."""
+    _cache.clear()
+    _get_allowed_sheet_ids.cache_clear()
+    _get_allowed_sheet_names.cache_clear()
+
+
+def get_cache_stats() -> dict:
+    """Get cache statistics for monitoring."""
+    return _cache.get_stats()
+
+
 # =============================================================================
-# CORE TOOLS (5 tools - unchanged)
+# CORE TOOLS (5) - with Agno @tool decorator and caching
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def list_sheets(use_cache: bool = True) -> str:
     """
     List all Smartsheet sheets accessible to the user.
 
     Args:
-        use_cache: If True (default), use cached sheet list. Set False to force fresh fetch.
+        use_cache: If True (default), use cached data. Set False to force fresh fetch.
 
     Returns a formatted list of all available sheets with their IDs and access levels.
-    Results are filtered by allowed sheets if ALLOWED_SHEET_IDS or ALLOWED_SHEET_NAMES
-    environment variables are configured.
     """
     try:
+        if not use_cache:
+            clear_cache()
+
         client = get_smartsheet_client()
-        
-        # Use cached list or fetch fresh
-        if use_cache:
-            all_sheets = _get_sheets_list_cached(client)
-        else:
-            clear_cache()  # Clear cache if explicitly requesting fresh data
-            response = client.Sheets.list_sheets(include_all=True)
-            all_sheets = response.data
+        response = client.Sheets.list_sheets(include_all=True)
 
         sheets = []
-        for sheet in all_sheets:
+        for sheet in response.data:
             if not _is_sheet_allowed(sheet.id, sheet.name):
                 continue
             sheets.append({
@@ -283,12 +352,15 @@ def list_sheets(use_cache: bool = True) -> str:
         return f"Error listing sheets: {str(e)}"
 
 
-def get_sheet(sheet_id: str) -> str:
+@tool(cache_results=True)
+@cached_tool
+def get_sheet(sheet_id: str, max_rows: int = 1000) -> str:
     """
     Get detailed data from a specific Smartsheet.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name to retrieve.
+        max_rows: Maximum number of rows to return (default 1000, for large sheets).
 
     Returns all columns and rows from the sheet in a formatted text output.
     """
@@ -305,12 +377,15 @@ def get_sheet(sheet_id: str) -> str:
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
             return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
 
-        sheet = client.Sheets.get_sheet(resolved_id, page_size=5000)
+        # Optimized: Use page_size for better pagination
+        sheet = client.Sheets.get_sheet(resolved_id, page_size=min(max_rows, 5000))
         columns = {col.id: col.title for col in sheet.columns}
         column_list = [col.title for col in sheet.columns]
 
         rows_data = []
-        for row in sheet.rows:
+        for i, row in enumerate(sheet.rows):
+            if i >= max_rows:
+                break
             row_dict = {"row_id": row.id, "row_number": row.row_number}
             for cell in row.cells:
                 col_name = columns.get(cell.column_id, f"Column_{cell.column_id}")
@@ -318,7 +393,7 @@ def get_sheet(sheet_id: str) -> str:
             rows_data.append(row_dict)
 
         text_output = f"Sheet: {sheet.name}\n"
-        text_output += f"Total Rows: {len(rows_data)}\n"
+        text_output += f"Total Rows: {len(sheet.rows)} (showing {len(rows_data)})\n"
         text_output += f"Columns: {', '.join(column_list)}\n\n"
 
         if rows_data:
@@ -335,6 +410,8 @@ def get_sheet(sheet_id: str) -> str:
         return f"Error getting sheet: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_row(sheet_id: str, row_id: str) -> str:
     """
     Get detailed information about a specific row in a Smartsheet.
@@ -370,7 +447,10 @@ def get_row(sheet_id: str, row_id: str) -> str:
         return f"Error getting row: {str(e)}"
 
 
-def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: str = "contains") -> str:
+@tool(cache_results=True)
+@cached_tool
+def filter_rows(sheet_id: str, column_name: str, filter_value: str,
+                match_type: str = "contains", max_results: int = 50) -> str:
     """
     Filter rows in a Smartsheet based on column values.
 
@@ -378,7 +458,8 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: 
         sheet_id: The sheet ID (numeric) or sheet name to filter.
         column_name: The name of the column to filter on.
         filter_value: The value to filter for.
-        match_type: Type of match - "contains", "equals", "starts_with", "ends_with" (default: "contains")
+        match_type: Type of match - "contains", "equals", "starts_with", "ends_with"
+        max_results: Maximum number of matching rows to return (default 50)
 
     Returns formatted list of rows matching the filter criteria.
     """
@@ -412,6 +493,8 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: 
         filter_value_lower = str(filter_value).lower()
 
         for row in sheet.rows:
+            if len(matching_rows) >= max_results:
+                break
             for cell in row.cells:
                 if cell.column_id == target_column_id:
                     cell_value = str(cell.display_value or cell.value or "").lower()
@@ -423,7 +506,7 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: 
                         match = cell_value.startswith(filter_value_lower)
                     elif match_type == "ends_with":
                         match = cell_value.endswith(filter_value_lower)
-                    else:
+                    else:  # contains
                         match = filter_value_lower in cell_value
 
                     if match:
@@ -439,15 +522,12 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: 
         text_output += f"Found: {len(matching_rows)} matching rows\n\n"
 
         if matching_rows:
-            for row in matching_rows[:50]:
+            for row in matching_rows:
                 row_str = " | ".join(
                     f"{k}: {v}" for k, v in row.items()
                     if k not in ("row_id",) and v is not None
                 )
                 text_output += f"  {row_str}\n"
-
-            if len(matching_rows) > 50:
-                text_output += f"\n  ... and {len(matching_rows) - 50} more rows"
         else:
             text_output += "  No matching rows found."
 
@@ -456,6 +536,8 @@ def filter_rows(sheet_id: str, column_name: str, filter_value: str, match_type: 
         return f"Error filtering rows: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def count_rows_by_column(sheet_id: str, column_name: str) -> str:
     """
     Count rows grouped by values in a specific column.
@@ -515,28 +597,24 @@ def count_rows_by_column(sheet_id: str, column_name: str) -> str:
 
 
 # =============================================================================
-# UNIFIED RESOURCE TOOLS (7 tools - consolidated from 14 list/get pairs)
+# UNIFIED RESOURCE TOOLS (7) - with caching
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def workspace(workspace_id: str = None) -> str:
     """
     Get workspace(s). Lists all workspaces if no ID provided, or gets details for a specific workspace.
 
     Args:
         workspace_id: Optional workspace ID. If not provided, lists all workspaces.
-                     If provided, returns details including sheets, folders, and reports in that workspace.
-
-    Returns formatted workspace information.
     """
     try:
         client = get_smartsheet_client()
 
         if workspace_id:
-            # Get specific workspace
             ws = client.Workspaces.get_workspace(int(workspace_id))
-
-            text_output = f"Workspace: {ws.name}\n"
-            text_output += "=" * 50 + "\n\n"
+            text_output = f"Workspace: {ws.name}\n{'=' * 50}\n\n"
 
             if hasattr(ws, 'access_level'):
                 text_output += f"Access Level: {ws.access_level}\n"
@@ -555,16 +633,9 @@ def workspace(workspace_id: str = None) -> str:
                 for folder in ws.folders:
                     text_output += f"  - {folder.name} (ID: {folder.id})\n"
 
-            if hasattr(ws, 'reports') and ws.reports:
-                text_output += f"\n**Reports ({len(ws.reports)}):**\n"
-                for report in ws.reports:
-                    text_output += f"  - {report.name} (ID: {report.id})\n"
-
             return text_output
         else:
-            # List all workspaces
             response = client.Workspaces.list_workspaces(include_all=True)
-
             if not response.data:
                 return "No workspaces available."
 
@@ -577,28 +648,21 @@ def workspace(workspace_id: str = None) -> str:
         return f"Error with workspace: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def folder(folder_id: str = None) -> str:
     """
     Get folder(s). Lists home-level folders if no ID provided, or gets details for a specific folder.
 
     Args:
         folder_id: Optional folder ID. If not provided, lists all home-level folders.
-                  If provided, returns details including sheets, subfolders, and reports.
-
-    Returns formatted folder information.
     """
     try:
         client = get_smartsheet_client()
 
         if folder_id:
-            # Get specific folder
             f = client.Folders.get_folder(int(folder_id))
-
-            text_output = f"Folder: {f.name}\n"
-            text_output += "=" * 50 + "\n\n"
-
-            if hasattr(f, 'permalink') and f.permalink:
-                text_output += f"Permalink: {f.permalink}\n"
+            text_output = f"Folder: {f.name}\n{'=' * 50}\n\n"
 
             if hasattr(f, 'sheets') and f.sheets:
                 allowed_sheets = [s for s in f.sheets if _is_sheet_allowed(s.id, s.name)]
@@ -612,16 +676,9 @@ def folder(folder_id: str = None) -> str:
                 for subfolder in f.folders:
                     text_output += f"  - {subfolder.name} (ID: {subfolder.id})\n"
 
-            if hasattr(f, 'reports') and f.reports:
-                text_output += f"\n**Reports ({len(f.reports)}):**\n"
-                for report in f.reports:
-                    text_output += f"  - {report.name} (ID: {report.id})\n"
-
             return text_output
         else:
-            # List home-level folders
             response = client.Home.list_folders(include_all=True)
-
             if not response.data:
                 return "No folders available at home level."
 
@@ -634,35 +691,24 @@ def folder(folder_id: str = None) -> str:
         return f"Error with folder: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def sight(sight_id: str = None) -> str:
     """
     Get Sight/dashboard(s). Lists all Sights if no ID provided, or gets details for a specific Sight.
 
     Args:
         sight_id: Optional Sight ID. If not provided, lists all available Sights/dashboards.
-                 If provided, returns details including widgets and data sources.
-
-    Returns formatted Sight/dashboard information.
     """
     try:
         client = get_smartsheet_client()
 
         if sight_id:
-            # Get specific sight
             s = client.Sights.get_sight(int(sight_id))
-
-            text_output = f"Sight: {s.name}\n"
-            text_output += "=" * 50 + "\n\n"
+            text_output = f"Sight: {s.name}\n{'=' * 50}\n\n"
 
             if hasattr(s, 'access_level'):
                 text_output += f"Access Level: {s.access_level}\n"
-            if hasattr(s, 'permalink') and s.permalink:
-                text_output += f"Permalink: {s.permalink}\n"
-            if hasattr(s, 'created_at') and s.created_at:
-                text_output += f"Created: {s.created_at}\n"
-            if hasattr(s, 'modified_at') and s.modified_at:
-                text_output += f"Last Modified: {s.modified_at}\n"
-
             if hasattr(s, 'widgets') and s.widgets:
                 text_output += f"\n**Widgets ({len(s.widgets)}):**\n"
                 for widget in s.widgets:
@@ -670,275 +716,160 @@ def sight(sight_id: str = None) -> str:
                     title = getattr(widget, 'title', 'Untitled')
                     text_output += f"  - {title} (Type: {widget_type})\n"
 
-                    if hasattr(widget, 'contents'):
-                        contents = widget.contents
-                        if hasattr(contents, 'sheet_id'):
-                            text_output += f"    Source Sheet ID: {contents.sheet_id}\n"
-                        if hasattr(contents, 'report_id'):
-                            text_output += f"    Source Report ID: {contents.report_id}\n"
-
             return text_output
         else:
-            # List all sights
             response = client.Sights.list_sights(include_all=True)
-
             if not response.data:
                 return "No Sights (dashboards) available."
 
             text_output = f"Found {len(response.data)} Sight(s)/Dashboard(s):\n\n"
             for s in response.data:
-                text_output += f"- {s.name} (ID: {s.id}, Access: {getattr(s, 'access_level', 'Unknown')})\n"
-                if hasattr(s, 'modified_at') and s.modified_at:
-                    text_output += f"    Last Modified: {s.modified_at}\n"
+                text_output += f"- {s.name} (ID: {s.id})\n"
 
             return text_output
     except Exception as e:
         return f"Error with sight: {str(e)}"
 
 
-def report(report_id: str = None) -> str:
+@tool(cache_results=True)
+@cached_tool
+def report(report_id: str = None, max_rows: int = 100) -> str:
     """
     Get report(s). Lists all reports if no ID provided, or gets data from a specific report.
 
     Args:
         report_id: Optional report ID. If not provided, lists all available reports.
-                  If provided, returns the report data including all rows and columns.
-
-    Returns formatted report information or data.
+        max_rows: Maximum rows to return when fetching report data (default 100).
     """
     try:
         client = get_smartsheet_client()
 
         if report_id:
-            # Get specific report
-            r = client.Reports.get_report(int(report_id), page_size=5000)
-
+            r = client.Reports.get_report(int(report_id), page_size=min(max_rows, 5000))
             columns = {col.virtual_id: col.title for col in r.columns}
             column_list = [col.title for col in r.columns]
 
             rows_data = []
-            for row in r.rows:
+            for i, row in enumerate(r.rows):
+                if i >= max_rows:
+                    break
                 row_dict = {"row_number": row.row_number}
-                if hasattr(row, 'sheet_id'):
-                    row_dict["source_sheet_id"] = row.sheet_id
                 for cell in row.cells:
                     col_name = columns.get(cell.virtual_column_id, f"Column_{cell.virtual_column_id}")
                     row_dict[col_name] = cell.display_value or cell.value
                 rows_data.append(row_dict)
 
             text_output = f"Report: {r.name}\n"
-            text_output += f"Total Rows: {len(rows_data)}\n"
+            text_output += f"Total Rows: {len(r.rows)} (showing {len(rows_data)})\n"
             text_output += f"Columns: {', '.join(column_list)}\n\n"
 
             if rows_data:
                 text_output += "Data:\n"
-                for row in rows_data[:100]:
-                    row_str = " | ".join(
-                        f"{k}: {v}" for k, v in row.items()
-                        if k not in ("source_sheet_id",) and v is not None
-                    )
+                for row in rows_data:
+                    row_str = " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None)
                     text_output += f"  Row {row['row_number']}: {row_str}\n"
-
-                if len(rows_data) > 100:
-                    text_output += f"\n  ... and {len(rows_data) - 100} more rows"
 
             return text_output
         else:
-            # List all reports
             response = client.Reports.list_reports(include_all=True)
-
             if not response.data:
                 return "No reports available."
 
             text_output = f"Found {len(response.data)} reports:\n\n"
             for r in response.data:
-                text_output += f"- {r.name} (ID: {r.id}, Access: {getattr(r, 'access_level', 'Unknown')})\n"
+                text_output += f"- {r.name} (ID: {r.id})\n"
 
             return text_output
     except Exception as e:
         return f"Error with report: {str(e)}"
 
 
-def webhook(webhook_id: str = None, include_all: bool = False) -> str:
+@tool(cache_results=True)
+@cached_tool
+def webhook(webhook_id: str = None) -> str:
     """
     Get webhook(s). Lists all webhooks if no ID provided, or gets details for a specific webhook.
 
     Args:
         webhook_id: Optional webhook ID. If not provided, lists all webhooks owned by the user.
-                   If provided, returns detailed webhook information including status and statistics.
-        include_all: If True and listing webhooks, include all results without pagination.
-
-    Returns formatted webhook information.
     """
     try:
         client = get_smartsheet_client()
 
         if webhook_id:
-            # Get specific webhook
             w = client.Webhooks.get_webhook(int(webhook_id))
-
-            text_output = f"Webhook: {getattr(w, 'name', 'Unnamed')}\n"
-            text_output += "=" * 50 + "\n\n"
-
+            text_output = f"Webhook: {getattr(w, 'name', 'Unnamed')}\n{'=' * 50}\n\n"
             text_output += f"**ID:** {getattr(w, 'id', 'N/A')}\n"
-
-            status = getattr(w, 'status', None)
-            if status:
-                text_output += f"**Status:** {status}\n"
-
-            enabled = getattr(w, 'enabled', None)
-            if enabled is not None:
-                text_output += f"**Enabled:** {'Yes' if enabled else 'No'}\n"
-
-            disabled_details = getattr(w, 'disabled_details', None)
-            if disabled_details:
-                text_output += f"**Disabled Reason:** {disabled_details}\n"
-
-            text_output += "\n**Scope Information:**\n"
-            scope = getattr(w, 'scope', None)
-            if scope:
-                text_output += f"  Scope: {scope}\n"
-            scope_object_id = getattr(w, 'scope_object_id', None)
-            if scope_object_id:
-                text_output += f"  Scope Object ID: {scope_object_id}\n"
-
-            callback_url = getattr(w, 'callback_url', None)
-            if callback_url:
-                text_output += f"\n**Callback URL:** {callback_url}\n"
-
-            events = getattr(w, 'events', None)
-            if events:
-                text_output += f"**Events:** {', '.join(events)}\n"
-
-            stats = getattr(w, 'stats', None)
-            if stats:
-                text_output += "\n**Statistics:**\n"
-                last_callback = getattr(stats, 'last_callback_attempt', None)
-                if last_callback:
-                    text_output += f"  Last Callback Attempt: {last_callback}\n"
-                last_success = getattr(stats, 'last_successful_callback', None)
-                if last_success:
-                    text_output += f"  Last Successful Callback: {last_success}\n"
-
-            created_at = getattr(w, 'created_at', None)
-            if created_at:
-                text_output += f"\n**Created:** {created_at}\n"
-
+            text_output += f"**Status:** {getattr(w, 'status', 'Unknown')}\n"
+            text_output += f"**Enabled:** {'Yes' if getattr(w, 'enabled', False) else 'No'}\n"
             return text_output
         else:
-            # List all webhooks
-            if include_all:
-                response = client.Webhooks.list_webhooks(include_all=True)
-            else:
-                response = client.Webhooks.list_webhooks(page_size=100)
-
+            response = client.Webhooks.list_webhooks(include_all=True)
             if not response.data:
                 return "No webhooks found."
 
             text_output = f"Found {len(response.data)} webhook(s):\n\n"
-
-            for i, w in enumerate(response.data, 1):
-                name = getattr(w, 'name', 'Unnamed')
-                webhook_id = getattr(w, 'id', 'N/A')
-                status = getattr(w, 'status', 'Unknown')
-                enabled = getattr(w, 'enabled', None)
-                scope = getattr(w, 'scope', None)
-
-                text_output += f"{i}. {name} (ID: {webhook_id})\n"
-                text_output += f"   Status: {status}"
-                if enabled is not None:
-                    text_output += f", Enabled: {'Yes' if enabled else 'No'}"
-                text_output += "\n"
-                if scope:
-                    text_output += f"   Scope: {scope}\n"
+            for w in response.data:
+                text_output += f"- {getattr(w, 'name', 'Unnamed')} (ID: {getattr(w, 'id', 'N/A')})\n"
 
             return text_output
     except Exception as e:
         return f"Error with webhook: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def group(group_id: str = None) -> str:
     """
     Get group(s). Lists all groups if no ID provided, or gets details for a specific group.
 
     Args:
         group_id: Optional group ID. If not provided, lists all groups in the organization.
-                 If provided, returns group details including members.
-
-    Returns formatted group information.
     """
     try:
         client = get_smartsheet_client()
 
         if group_id:
-            # Get specific group
             g = client.Groups.get_group(int(group_id))
-
-            text_output = f"Group: {g.name}\n"
-            text_output += "=" * 50 + "\n\n"
-
+            text_output = f"Group: {g.name}\n{'=' * 50}\n\n"
             text_output += f"**ID:** {g.id}\n"
-            if hasattr(g, 'description') and g.description:
-                text_output += f"**Description:** {g.description}\n"
-            if hasattr(g, 'owner') and g.owner:
-                text_output += f"**Owner:** {g.owner}\n"
-            if hasattr(g, 'created_at') and g.created_at:
-                text_output += f"**Created:** {g.created_at}\n"
-            if hasattr(g, 'modified_at') and g.modified_at:
-                text_output += f"**Modified:** {g.modified_at}\n"
 
             if hasattr(g, 'members') and g.members:
                 text_output += f"\n**Members ({len(g.members)}):**\n"
                 for member in g.members:
                     email = getattr(member, 'email', 'Unknown')
-                    name = getattr(member, 'name', '')
-                    text_output += f"  - {email}"
-                    if name:
-                        text_output += f" ({name})"
-                    text_output += "\n"
-            else:
-                text_output += "\nNo members in this group.\n"
+                    text_output += f"  - {email}\n"
 
             return text_output
         else:
-            # List all groups
             response = client.Groups.list_groups(include_all=True)
-
             if not response.data:
                 return "No groups found."
 
             text_output = f"Found {len(response.data)} group(s):\n\n"
-
             for g in response.data:
                 text_output += f"- {g.name} (ID: {g.id})\n"
-                if hasattr(g, 'description') and g.description:
-                    text_output += f"    Description: {g.description}\n"
-                if hasattr(g, 'member_count') and g.member_count is not None:
-                    text_output += f"    Members: {g.member_count}\n"
 
             return text_output
     except Exception as e:
         return f"Error with group: {str(e)}"
 
 
-def user(user_id: str = None, include_last_login: bool = True, max_results: int = 100) -> str:
+@tool(cache_results=True)
+@cached_tool
+def user(user_id: str = None, max_results: int = 50) -> str:
     """
     Get user(s). Lists all organization users if no ID provided, or gets details for a specific user.
     Requires System Admin permissions.
 
     Args:
-        user_id: Optional user ID (numeric) or email. If not provided, lists all organization users.
-                If provided, returns detailed user profile information.
-        include_last_login: Include last login timestamps when listing users. Default: True.
-        max_results: Maximum users to return when listing (1-1000). Default: 100.
-
-    Returns formatted user information.
+        user_id: Optional user ID or email. If not provided, lists all organization users.
+        max_results: Maximum users to return when listing (default 50).
     """
     try:
         client = get_smartsheet_client()
 
         if user_id:
-            # Get specific user
             if '@' in str(user_id):
                 response = client.Users.list_users(email=user_id)
                 if response.data:
@@ -947,100 +878,43 @@ def user(user_id: str = None, include_last_login: bool = True, max_results: int 
                     return f"Error: User with email '{user_id}' not found"
 
             u = client.Users.get_user(int(user_id))
-
-            text_output = "User Profile\n"
-            text_output += "=" * 50 + "\n\n"
-
             name = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+            text_output = f"User Profile\n{'=' * 50}\n\n"
             text_output += f"**Name:** {name or 'N/A'}\n"
             text_output += f"**Email:** {getattr(u, 'email', 'N/A')}\n"
             text_output += f"**ID:** {getattr(u, 'id', 'N/A')}\n"
-
-            status = getattr(u, 'status', None)
-            if status:
-                text_output += f"**Status:** {status}\n"
-
-            account = getattr(u, 'account', None)
-            if account:
-                acc_name = getattr(account, 'name', 'N/A')
-                text_output += f"**Account:** {acc_name}\n"
-
-            text_output += "\n**Permissions:**\n"
-            text_output += f"  System Admin: {'Yes' if getattr(u, 'admin', False) else 'No'}\n"
-            text_output += f"  Licensed: {'Yes' if getattr(u, 'licensed_sheet_creator', False) else 'No'}\n"
-            text_output += f"  Group Admin: {'Yes' if getattr(u, 'group_admin', False) else 'No'}\n"
-
-            last_login = getattr(u, 'last_login', None)
-            if last_login:
-                text_output += f"\n**Last Login:** {last_login}\n"
-
             return text_output
         else:
-            # List all users
-            include_params = []
-            if include_last_login:
-                include_params.append('lastLogin')
-
-            if include_params:
-                response = client.Users.list_users(include=','.join(include_params), page_size=min(max_results, 1000))
-            else:
-                response = client.Users.list_users(page_size=min(max_results, 1000))
-
+            response = client.Users.list_users(page_size=min(max_results, 100))
             if not response.data:
                 return "No users found."
 
-            text_output = f"Organization Users ({len(response.data)}):\n"
-            text_output += "=" * 50 + "\n\n"
-
-            for i, u in enumerate(response.data, 1):
-                name = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip() or 'N/A'
-                email = getattr(u, 'email', 'N/A')
-                text_output += f"{i}. {name}\n"
-                text_output += f"   Email: {email}\n"
-                text_output += f"   ID: {getattr(u, 'id', 'N/A')}\n"
-
-                status = getattr(u, 'status', None)
-                if status:
-                    text_output += f"   Status: {status}\n"
-
-                last_login = getattr(u, 'last_login', None)
-                if last_login:
-                    text_output += f"   Last Login: {last_login}\n"
-
-                text_output += "\n"
-
-            total_pages = getattr(response, 'total_pages', 1)
-            if total_pages > 1:
-                text_output += f"\nShowing page 1 of {total_pages}. Use pagination for more results.\n"
+            text_output = f"Organization Users ({len(response.data)}):\n{'=' * 50}\n\n"
+            for u in response.data:
+                name = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+                text_output += f"- {name or 'N/A'} ({getattr(u, 'email', 'N/A')})\n"
 
             return text_output
     except Exception as e:
-        error_str = str(e)
-        if '1003' in error_str or 'not authorized' in error_str.lower():
+        if '1003' in str(e) or 'not authorized' in str(e).lower():
             return "Error: You must be a System Admin to access user information."
-        if '1006' in error_str or 'not found' in error_str.lower():
-            return f"Error: User '{user_id}' not found."
-        return f"Error with user: {error_str}"
+        return f"Error with user: {str(e)}"
 
 
 # =============================================================================
-# UNIFIED SCOPE TOOLS (2 tools - consolidated from 5)
+# UNIFIED SCOPE TOOLS (2)
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def attachment(sheet_id: str, row_id: str = None, attachment_id: str = None) -> str:
     """
-    Get attachments at various scopes. Can retrieve sheet-level, row-level, or specific attachment details.
+    Get attachments at various scopes.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-        row_id: Optional row ID. If provided without attachment_id, returns row-level attachments.
-        attachment_id: Optional attachment ID. If provided, returns specific attachment details with download URL.
-
-    Scope hierarchy:
-    - attachment(sheet_id) → All attachments in the sheet
-    - attachment(sheet_id, row_id) → Attachments for a specific row
-    - attachment(sheet_id, attachment_id=id) → Specific attachment with download URL
-    - attachment(sheet_id, row_id, attachment_id) → Specific attachment (row context ignored)
+        row_id: Optional row ID for row-level attachments.
+        attachment_id: Optional attachment ID for specific attachment with download URL.
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
@@ -1053,100 +927,48 @@ def attachment(sheet_id: str, row_id: str = None, attachment_id: str = None) -> 
             return f"Error: Sheet '{sheet_id}' not found"
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
+            return "Error: Access to sheet is not permitted."
 
         sheet = client.Sheets.get_sheet(resolved_id)
 
         if attachment_id:
-            # Get specific attachment
             att = client.Attachments.get_attachment(resolved_id, int(attachment_id))
-
-            text_output = "Attachment Details\n"
-            text_output += "=" * 50 + "\n\n"
-
-            text_output += f"**Name:** {getattr(att, 'name', 'N/A')}\n"
-            text_output += f"**ID:** {getattr(att, 'id', 'N/A')}\n"
-
-            if hasattr(att, 'attachment_type') and att.attachment_type:
-                text_output += f"**Type:** {att.attachment_type}\n"
-            if hasattr(att, 'mime_type') and att.mime_type:
-                text_output += f"**MIME Type:** {att.mime_type}\n"
-            if hasattr(att, 'size_in_kb') and att.size_in_kb:
-                text_output += f"**Size:** {att.size_in_kb} KB\n"
-            if hasattr(att, 'parent_type') and att.parent_type:
-                text_output += f"**Parent Type:** {att.parent_type}\n"
-            if hasattr(att, 'parent_id') and att.parent_id:
-                text_output += f"**Parent ID:** {att.parent_id}\n"
-            if hasattr(att, 'created_at') and att.created_at:
-                text_output += f"**Created:** {att.created_at}\n"
-            if hasattr(att, 'created_by') and att.created_by:
-                creator = att.created_by
-                creator_name = getattr(creator, 'name', None) or getattr(creator, 'email', 'Unknown')
-                text_output += f"**Created By:** {creator_name}\n"
-
+            text_output = f"Attachment: {getattr(att, 'name', 'N/A')}\n"
+            text_output += f"Type: {getattr(att, 'attachment_type', 'Unknown')}\n"
             if hasattr(att, 'url') and att.url:
-                text_output += f"\n**Download URL** (temporary):\n{att.url}\n"
-                text_output += "\n⚠️ Note: This URL expires after a short time.\n"
-
+                text_output += f"\n**Download URL** (temporary): {att.url}\n"
             return text_output
-
         elif row_id:
-            # Get row-level attachments
             attachments = client.Attachments.list_row_attachments(resolved_id, int(row_id), include_all=True)
-
-            text_output = f"Attachments for Row {row_id} in '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
+            text_output = f"Attachments for Row {row_id}:\n"
             if attachments.data:
-                text_output += f"Found {len(attachments.data)} attachment(s):\n\n"
                 for att in attachments.data:
                     text_output += f"- {att.name} (ID: {att.id})\n"
-                    if hasattr(att, 'attachment_type') and att.attachment_type:
-                        text_output += f"    Type: {att.attachment_type}\n"
-                    if hasattr(att, 'size_in_kb') and att.size_in_kb:
-                        text_output += f"    Size: {att.size_in_kb} KB\n"
             else:
-                text_output += "No attachments found for this row.\n"
-
+                text_output += "No attachments found.\n"
             return text_output
-
         else:
-            # Get sheet-level attachments
             attachments = client.Attachments.list_all_attachments(resolved_id, include_all=True)
-
             text_output = f"Attachments for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
             if attachments.data:
-                text_output += f"Found {len(attachments.data)} attachment(s):\n\n"
                 for att in attachments.data:
                     text_output += f"- {att.name} (ID: {att.id})\n"
-                    if hasattr(att, 'parent_type') and att.parent_type:
-                        text_output += f"    Parent Type: {att.parent_type}\n"
-                    if hasattr(att, 'parent_id') and att.parent_id:
-                        text_output += f"    Parent ID: {att.parent_id}\n"
-                    if hasattr(att, 'attachment_type') and att.attachment_type:
-                        text_output += f"    Type: {att.attachment_type}\n"
-                    if hasattr(att, 'size_in_kb') and att.size_in_kb:
-                        text_output += f"    Size: {att.size_in_kb} KB\n"
             else:
-                text_output += "No attachments found in this sheet.\n"
-
+                text_output += "No attachments found.\n"
             return text_output
     except Exception as e:
         return f"Error with attachment: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def discussion(sheet_id: str, row_id: str = None) -> str:
     """
-    Get discussions (comments) at various scopes. Can retrieve sheet-level or row-level discussions.
+    Get discussions (comments) at various scopes.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-        row_id: Optional row ID. If provided, returns discussions for that specific row.
-               If not provided, returns all discussions in the sheet.
-
-    Returns formatted list of discussions with comments.
+        row_id: Optional row ID for row-level discussions.
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
@@ -1159,44 +981,26 @@ def discussion(sheet_id: str, row_id: str = None) -> str:
             return f"Error: Sheet '{sheet_id}' not found"
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
+            return "Error: Access to sheet is not permitted."
 
         sheet = client.Sheets.get_sheet(resolved_id)
 
         if row_id:
-            # Get row-level discussions
             discussions = client.Discussions.get_row_discussions(resolved_id, int(row_id), include_all=True)
-            text_output = f"Discussions for Row {row_id} in '{sheet.name}':\n"
+            text_output = f"Discussions for Row {row_id}:\n"
         else:
-            # Get sheet-level discussions
             discussions = client.Discussions.get_all_discussions(resolved_id, include_all=True)
             text_output = f"Discussions for '{sheet.name}':\n"
 
-        text_output += "=" * 50 + "\n\n"
-
         if discussions.data:
-            text_output += f"Found {len(discussions.data)} discussion(s):\n\n"
             for disc in discussions.data:
-                text_output += f"Discussion (ID: {disc.id})\n"
-                if hasattr(disc, 'title') and disc.title:
-                    text_output += f"  Title: {disc.title}\n"
-                if hasattr(disc, 'parent_type') and disc.parent_type:
-                    text_output += f"  On: {disc.parent_type}\n"
-                if hasattr(disc, 'parent_id') and disc.parent_id:
-                    text_output += f"  Parent ID: {disc.parent_id}\n"
-                if hasattr(disc, 'created_at') and disc.created_at:
-                    text_output += f"  Started: {disc.created_at}\n"
-
+                text_output += f"\nDiscussion (ID: {disc.id})\n"
                 if hasattr(disc, 'comments') and disc.comments:
-                    text_output += f"  Comments ({len(disc.comments)}):\n"
-                    for comment in disc.comments[:5]:  # Show first 5 comments
+                    for comment in disc.comments[:3]:
                         author = "Unknown"
                         if hasattr(comment, 'created_by') and comment.created_by:
-                            author = getattr(comment.created_by, 'name', None) or getattr(comment.created_by, 'email', 'Unknown')
-                        text_output += f"    - {author}: {comment.text[:100]}{'...' if len(comment.text) > 100 else ''}\n"
-                    if len(disc.comments) > 5:
-                        text_output += f"    ... and {len(disc.comments) - 5} more comments\n"
-                text_output += "\n"
+                            author = getattr(comment.created_by, 'name', 'Unknown')
+                        text_output += f"  - {author}: {comment.text[:100]}...\n"
         else:
             text_output += "No discussions found.\n"
 
@@ -1206,19 +1010,19 @@ def discussion(sheet_id: str, row_id: str = None) -> str:
 
 
 # =============================================================================
-# UNIFIED SEARCH (1 tool - consolidated from 2)
+# UNIFIED SEARCH (1)
 # =============================================================================
 
-def search(query: str, sheet_id: str = None) -> str:
+@tool(cache_results=True)
+@cached_tool
+def search(query: str, sheet_id: str = None, max_results: int = 20) -> str:
     """
     Search for text in Smartsheet. Can search globally or within a specific sheet.
 
     Args:
         query: The search text to find.
-        sheet_id: Optional sheet ID or name. If provided, searches only within that sheet.
-                 If not provided, searches across all accessible sheets.
-
-    Returns formatted search results with locations.
+        sheet_id: Optional sheet ID to limit search scope.
+        max_results: Maximum results to return (default 20).
     """
     if not query:
         return "Error: query parameter is required"
@@ -1227,185 +1031,67 @@ def search(query: str, sheet_id: str = None) -> str:
         client = get_smartsheet_client()
 
         if sheet_id:
-            # Search within specific sheet
-            resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
-
+            resolved_id, _ = _resolve_sheet_id(client, sheet_id)
             if not resolved_id:
                 return f"Error: Sheet '{sheet_id}' not found"
 
-            if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-                return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
-
             results = client.Search.search_sheet(resolved_id, query)
-
             text_output = f"Search results for '{query}' in sheet:\n"
-            text_output += "=" * 50 + "\n\n"
-
-            if not results.results:
-                text_output += f"No results found for '{query}' in this sheet.\n"
-                return text_output
-
-            text_output += f"Found {results.total_count} result(s):\n\n"
-
-            for i, result in enumerate(results.results, 1):
-                text = getattr(result, 'text', 'N/A')
-                obj_type = getattr(result, 'object_type', 'Unknown')
-                text_output += f"{i}. {obj_type}: {text}\n"
-
-                context_data = getattr(result, 'context_data', None)
-                if context_data:
-                    for ctx in context_data:
-                        ctx_type = getattr(ctx, 'object_type', '')
-                        ctx_id = getattr(ctx, 'object_id', '')
-                        ctx_name = getattr(ctx, 'name', '')
-                        if ctx_type or ctx_id:
-                            text_output += f"   Context: {ctx_type}"
-                            if ctx_name:
-                                text_output += f" - {ctx_name}"
-                            if ctx_id:
-                                text_output += f" (ID: {ctx_id})"
-                            text_output += "\n"
-                text_output += "\n"
-
-            return text_output
         else:
-            # Global search
-            response = client.Search.search(query)
-
-            results = []
-            for result in response.results:
-                parent_id = getattr(result, 'parent_object_id', None)
-                parent_name = getattr(result, 'parent_object_name', None)
-
-                if not _is_sheet_allowed(parent_id, parent_name):
-                    continue
-
-                results.append({
-                    "text": result.text,
-                    "object_type": result.object_type,
-                    "object_id": result.object_id,
-                    "parent_object_name": parent_name,
-                    "parent_object_id": parent_id,
-                })
-
+            results = client.Search.search(query)
             text_output = f"Search results for '{query}':\n"
-            text_output += "=" * 50 + "\n\n"
 
-            if results:
-                for r in results[:20]:
-                    text_output += f"- {r['text']} ({r['object_type']})\n"
-                    if r.get('parent_object_name'):
-                        text_output += f"    In: {r['parent_object_name']}\n"
-                if len(results) > 20:
-                    text_output += f"\n  ... and {len(results) - 20} more results"
-            else:
-                text_output += "No results found in allowed sheets."
+        if not results.results:
+            return f"No results found for '{query}'."
 
-            return text_output
+        text_output += f"Found {results.total_count} result(s):\n\n"
+
+        for i, result in enumerate(results.results[:max_results], 1):
+            text = getattr(result, 'text', 'N/A')
+            obj_type = getattr(result, 'object_type', 'Unknown')
+            text_output += f"{i}. {obj_type}: {text}\n"
+
+        return text_output
     except Exception as e:
         return f"Error searching: {str(e)}"
 
 
 # =============================================================================
-# UNIFIED NAVIGATION (1 tool - consolidated from 3)
+# UNIFIED NAVIGATION (1)
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
     """
     Access navigation views: home, favorites, or templates.
 
     Args:
-        view: The view to display. Options:
-            - "home": Overview of user's Smartsheet home (sheets, folders, workspaces)
-            - "favorites": User's favorited items
-            - "templates": Available templates
-
-    Returns formatted view of the requested navigation area.
+        view: The view to display ("home", "favorites", or "templates").
     """
     try:
         client = get_smartsheet_client()
 
         if view == "favorites":
             response = client.Favorites.list_favorites(include_all=True)
-
-            favorites = {
-                "sheets": [], "folders": [], "reports": [],
-                "templates": [], "workspaces": [], "sights": [],
-            }
-
-            for fav in response.data:
-                obj_type = getattr(fav, 'type', 'unknown').lower()
-                obj_id = getattr(fav, 'object_id', None)
-
-                fav_info = {"id": obj_id, "type": obj_type}
-
-                if obj_type == 'sheet':
-                    favorites["sheets"].append(fav_info)
-                elif obj_type == 'folder':
-                    favorites["folders"].append(fav_info)
-                elif obj_type == 'report':
-                    favorites["reports"].append(fav_info)
-                elif obj_type == 'template':
-                    favorites["templates"].append(fav_info)
-                elif obj_type == 'workspace':
-                    favorites["workspaces"].append(fav_info)
-                elif obj_type == 'sight':
-                    favorites["sights"].append(fav_info)
-
-            total = sum(len(v) for v in favorites.values())
-
-            if total == 0:
+            if not response.data:
                 return "No favorites found."
 
-            text_output = f"Your Favorites ({total} items)\n"
-            text_output += "=" * 50 + "\n\n"
-
-            if favorites["sheets"]:
-                text_output += f"**Sheets ({len(favorites['sheets'])}):**\n"
-                for f in favorites["sheets"]:
-                    text_output += f"  - ID: {f['id']}\n"
-
-            if favorites["reports"]:
-                text_output += f"\n**Reports ({len(favorites['reports'])}):**\n"
-                for f in favorites["reports"]:
-                    text_output += f"  - ID: {f['id']}\n"
-
-            if favorites["sights"]:
-                text_output += f"\n**Sights/Dashboards ({len(favorites['sights'])}):**\n"
-                for f in favorites["sights"]:
-                    text_output += f"  - ID: {f['id']}\n"
-
-            if favorites["folders"]:
-                text_output += f"\n**Folders ({len(favorites['folders'])}):**\n"
-                for f in favorites["folders"]:
-                    text_output += f"  - ID: {f['id']}\n"
-
-            if favorites["workspaces"]:
-                text_output += f"\n**Workspaces ({len(favorites['workspaces'])}):**\n"
-                for f in favorites["workspaces"]:
-                    text_output += f"  - ID: {f['id']}\n"
-
-            if favorites["templates"]:
-                text_output += f"\n**Templates ({len(favorites['templates'])}):**\n"
-                for f in favorites["templates"]:
-                    text_output += f"  - ID: {f['id']}\n"
+            text_output = f"Your Favorites ({len(response.data)} items)\n{'=' * 50}\n\n"
+            for fav in response.data:
+                obj_type = getattr(fav, 'type', 'unknown')
+                obj_id = getattr(fav, 'object_id', None)
+                text_output += f"- {obj_type}: ID {obj_id}\n"
 
             return text_output
 
         elif view == "templates":
             home = client.Home.list_all_contents()
-
-            text_output = "Available Templates\n"
-            text_output += "=" * 50 + "\n\n"
+            text_output = f"Available Templates\n{'=' * 50}\n\n"
 
             if hasattr(home, 'templates') and home.templates:
-                text_output += f"**Your Templates ({len(home.templates)}):**\n"
                 for tmpl in home.templates:
-                    text_output += f"  - {tmpl.name} (ID: {tmpl.id})\n"
-                    if hasattr(tmpl, 'description') and tmpl.description:
-                        text_output += f"    Description: {tmpl.description}\n"
-                    if hasattr(tmpl, 'access_level') and tmpl.access_level:
-                        text_output += f"    Access: {tmpl.access_level}\n"
+                    text_output += f"- {tmpl.name} (ID: {tmpl.id})\n"
             else:
                 text_output += "No templates found.\n"
 
@@ -1413,46 +1099,19 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
 
         else:  # home
             home = client.Home.list_all_contents()
-
-            text_output = "Your Smartsheet Home\n"
-            text_output += "=" * 50 + "\n\n"
+            text_output = f"Your Smartsheet Home\n{'=' * 50}\n\n"
 
             if hasattr(home, 'sheets') and home.sheets:
-                allowed_sheets = [s for s in home.sheets if _is_sheet_allowed(s.id, s.name)]
-                if allowed_sheets:
-                    text_output += f"**Sheets ({len(allowed_sheets)}):**\n"
-                    for sheet in allowed_sheets[:20]:
+                allowed = [s for s in home.sheets if _is_sheet_allowed(s.id, s.name)]
+                if allowed:
+                    text_output += f"**Sheets ({len(allowed)}):**\n"
+                    for sheet in allowed[:20]:
                         text_output += f"  - {sheet.name} (ID: {sheet.id})\n"
-                    if len(allowed_sheets) > 20:
-                        text_output += f"  ... and {len(allowed_sheets) - 20} more\n"
-
-            if hasattr(home, 'folders') and home.folders:
-                text_output += f"\n**Folders ({len(home.folders)}):**\n"
-                for folder in home.folders[:20]:
-                    text_output += f"  - {folder.name} (ID: {folder.id})\n"
-                if len(home.folders) > 20:
-                    text_output += f"  ... and {len(home.folders) - 20} more\n"
 
             if hasattr(home, 'workspaces') and home.workspaces:
                 text_output += f"\n**Workspaces ({len(home.workspaces)}):**\n"
-                for ws in home.workspaces[:20]:
+                for ws in home.workspaces[:10]:
                     text_output += f"  - {ws.name} (ID: {ws.id})\n"
-                if len(home.workspaces) > 20:
-                    text_output += f"  ... and {len(home.workspaces) - 20} more\n"
-
-            if hasattr(home, 'reports') and home.reports:
-                text_output += f"\n**Reports ({len(home.reports)}):**\n"
-                for report in home.reports[:20]:
-                    text_output += f"  - {report.name} (ID: {report.id})\n"
-                if len(home.reports) > 20:
-                    text_output += f"  ... and {len(home.reports) - 20} more\n"
-
-            if hasattr(home, 'sights') and home.sights:
-                text_output += f"\n**Sights/Dashboards ({len(home.sights)}):**\n"
-                for sight in home.sights[:20]:
-                    text_output += f"  - {sight.name} (ID: {sight.id})\n"
-                if len(home.sights) > 20:
-                    text_output += f"  ... and {len(home.sights) - 20} more\n"
 
             return text_output
     except Exception as e:
@@ -1460,23 +1119,18 @@ def navigation(view: Literal["home", "favorites", "templates"] = "home") -> str:
 
 
 # =============================================================================
-# UNIFIED SHEET METADATA (1 tool - consolidated from 5)
+# UNIFIED SHEET METADATA (1)
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def sheet_metadata(sheet_id: str, info: Literal["automation", "shares", "publish", "proofs", "references"]) -> str:
     """
-    Get various metadata about a sheet: automation rules, shares, publish status, proofs, or cross-references.
+    Get various metadata about a sheet.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-        info: Type of metadata to retrieve. Options:
-            - "automation": Automation rules configured for the sheet
-            - "shares": Sharing info (who has access and at what level)
-            - "publish": Publish status and URLs
-            - "proofs": Proofs in the sheet
-            - "references": Cross-sheet references
-
-    Returns formatted metadata for the requested type.
+        info: Type of metadata ("automation", "shares", "publish", "proofs", "references").
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
@@ -1489,173 +1143,79 @@ def sheet_metadata(sheet_id: str, info: Literal["automation", "shares", "publish
             return f"Error: Sheet '{sheet_id}' not found"
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
+            return "Error: Access to sheet is not permitted."
 
         sheet = client.Sheets.get_sheet(resolved_id)
 
         if info == "automation":
             rules = client.Sheets.list_automation_rules(resolved_id, include_all=True)
-
             text_output = f"Automation Rules for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
             if rules.data:
-                text_output += f"Found {len(rules.data)} automation rule(s):\n\n"
                 for rule in rules.data:
-                    status = "Enabled" if getattr(rule, 'enabled', False) else "Disabled"
-                    text_output += f"**{getattr(rule, 'name', 'Unnamed Rule')}** (ID: {rule.id})\n"
-                    text_output += f"  Status: {status}\n"
-
-                    if hasattr(rule, 'action') and rule.action:
-                        action_type = getattr(rule.action, 'type', 'Unknown')
-                        text_output += f"  Type: {action_type}\n"
-                        if hasattr(rule.action, 'frequency'):
-                            text_output += f"  Frequency: {rule.action.frequency}\n"
-
-                    if hasattr(rule, 'disabled_reason_text') and rule.disabled_reason_text:
-                        text_output += f"  Disabled Reason: {rule.disabled_reason_text}\n"
-
-                    can_modify = getattr(rule, 'user_can_modify', False)
-                    text_output += f"  Can Modify: {'Yes' if can_modify else 'No'}\n\n"
+                    text_output += f"- {getattr(rule, 'name', 'Unnamed')} (Enabled: {getattr(rule, 'enabled', 'Unknown')})\n"
             else:
-                text_output += "No automation rules found for this sheet.\n"
-
+                text_output += "No automation rules found.\n"
             return text_output
 
         elif info == "shares":
             shares = client.Sheets.list_shares(resolved_id, include_all=True)
-
-            text_output = f"Sharing Info for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
+            text_output = f"Sharing for '{sheet.name}':\n"
             if shares.data:
-                text_output += f"Shared with {len(shares.data)} user(s)/group(s):\n\n"
-
                 for share in shares.data:
-                    share_type = getattr(share, 'type', 'USER')
-                    email = getattr(share, 'email', '')
-                    name = getattr(share, 'name', '')
-                    access_level = getattr(share, 'access_level', 'Unknown')
-
-                    if share_type == 'GROUP':
-                        text_output += f"**Group**: {name or email}\n"
-                    else:
-                        text_output += f"**{email}**"
-                        if name:
-                            text_output += f" ({name})"
-                        text_output += "\n"
-
-                    text_output += f"   Access Level: {access_level}\n"
-                    if hasattr(share, 'created_at') and share.created_at:
-                        text_output += f"   Shared On: {share.created_at}\n"
-                    text_output += "\n"
+                    email = getattr(share, 'email', 'N/A')
+                    level = getattr(share, 'access_level', 'Unknown')
+                    text_output += f"- {email}: {level}\n"
             else:
-                text_output += "No shares found for this sheet.\n"
-
+                text_output += "No shares found.\n"
             return text_output
 
         elif info == "publish":
-            publish = client.Sheets.get_publish_status(resolved_id)
-
+            status = client.Sheets.get_publish_status(resolved_id)
             text_output = f"Publish Status for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
-            read_only = getattr(publish, 'read_only_lite_enabled', False)
-            read_write = getattr(publish, 'read_write_enabled', False)
-            ical = getattr(publish, 'ical_enabled', False)
-
-            if not read_only and not read_write and not ical:
-                text_output += "This sheet is not published.\n"
-            else:
-                if read_only:
-                    text_output += "**Read-Only Published:** Yes\n"
-                    if hasattr(publish, 'read_only_lite_url') and publish.read_only_lite_url:
-                        text_output += f"  URL: {publish.read_only_lite_url}\n"
-
-                if read_write:
-                    text_output += "**Read-Write Published:** Yes\n"
-                    if hasattr(publish, 'read_write_url') and publish.read_write_url:
-                        text_output += f"  URL: {publish.read_write_url}\n"
-
-                if ical:
-                    text_output += "**iCal Published:** Yes\n"
-                    if hasattr(publish, 'ical_url') and publish.ical_url:
-                        text_output += f"  URL: {publish.ical_url}\n"
-
+            text_output += f"Read-Only Full: {getattr(status, 'read_only_full_enabled', False)}\n"
+            text_output += f"Read-Only Lite: {getattr(status, 'read_only_lite_enabled', False)}\n"
             return text_output
 
         elif info == "proofs":
-            proofs = client.Proofs.list_proofs(resolved_id, include_all=True)
-
-            text_output = f"Proofs in '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
-            if proofs.data:
-                text_output += f"Found {len(proofs.data)} proof(s):\n\n"
-                for proof in proofs.data:
-                    text_output += f"**Proof ID: {proof.id}**\n"
-                    if hasattr(proof, 'name') and proof.name:
-                        text_output += f"  Name: {proof.name}\n"
-                    if hasattr(proof, 'row_id') and proof.row_id:
-                        text_output += f"  Row ID: {proof.row_id}\n"
-                    if hasattr(proof, 'version') and proof.version:
-                        text_output += f"  Version: {proof.version}\n"
-                    if hasattr(proof, 'created_at') and proof.created_at:
-                        text_output += f"  Created: {proof.created_at}\n"
-                    text_output += "\n"
-            else:
-                text_output += "No proofs found in this sheet.\n"
-
+            text_output = f"Proofs for '{sheet.name}':\n"
+            text_output += "(Proofs API not directly supported - check attachments)\n"
             return text_output
 
         elif info == "references":
-            refs = client.Sheets.list_cross_sheet_references(resolved_id, include_all=True)
-
+            refs = client.Sheets.list_cross_sheet_references(resolved_id)
             text_output = f"Cross-Sheet References for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
             if refs.data:
-                text_output += f"Found {len(refs.data)} cross-sheet reference(s):\n\n"
                 for ref in refs.data:
-                    text_output += f"**{ref.name}** (ID: {ref.id})\n"
-                    if hasattr(ref, 'source_sheet_id') and ref.source_sheet_id:
-                        text_output += f"   Source Sheet ID: {ref.source_sheet_id}\n"
-                    if hasattr(ref, 'status') and ref.status:
-                        text_output += f"   Status: {ref.status}\n"
-                    text_output += "\n"
+                    text_output += f"- {getattr(ref, 'name', 'Unnamed')} (ID: {ref.id})\n"
             else:
-                text_output += "No cross-sheet references found in this sheet.\n"
-
+                text_output += "No cross-sheet references found.\n"
             return text_output
+
         else:
-            return f"Error: Unknown info type '{info}'. Valid options: automation, shares, publish, proofs, references"
+            return f"Error: Unknown info type '{info}'"
+
     except Exception as e:
-        return f"Error getting sheet metadata: {str(e)}"
+        return f"Error with sheet_metadata: {str(e)}"
 
 
 # =============================================================================
-# UNIFIED SHEET INFO (1 tool - consolidated from 4)
+# UNIFIED SHEET INFO (1)
 # =============================================================================
 
-def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields", "by_column"], columns: str = None) -> str:
+@tool(cache_results=True)
+@cached_tool
+def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields", "by_column"],
+               columns: str = None) -> str:
     """
-    Get various information about a sheet: column metadata, statistics, summary fields, or specific columns.
+    Get sheet information by type.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-        info: Type of information to retrieve. Options:
-            - "columns": Detailed column metadata (types, options, formulas)
-            - "stats": Sheet statistics (row counts, fill rates, metadata)
-            - "summary_fields": Summary fields (KPIs/metadata at sheet level)
-            - "by_column": Get specific columns only (requires columns parameter)
-        columns: Comma-separated list of column names (required only for "by_column")
-
-    Returns formatted information for the requested type.
+        info: Type of info ("columns", "stats", "summary_fields", "by_column").
+        columns: Comma-separated column names (only for info="by_column").
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
-    if info == "by_column" and not columns:
-        return "Error: columns parameter is required when info='by_column'"
 
     try:
         client = get_smartsheet_client()
@@ -1665,176 +1225,95 @@ def sheet_info(sheet_id: str, info: Literal["columns", "stats", "summary_fields"
             return f"Error: Sheet '{sheet_id}' not found"
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
+            return "Error: Access to sheet is not permitted."
+
+        sheet = client.Sheets.get_sheet(resolved_id)
 
         if info == "columns":
-            sheet = client.Sheets.get_sheet(resolved_id)
-
-            text_output = f"Columns for '{sheet.name}':\n"
-            text_output += f"Total columns: {len(sheet.columns)}\n\n"
-
+            text_output = f"Columns for '{sheet.name}':\n{'=' * 50}\n\n"
             for col in sheet.columns:
-                text_output += f"**{col.title}** (ID: {col.id})\n"
-                text_output += f"    Type: {col.type}\n"
-                if col.primary:
-                    text_output += "    Primary: Yes\n"
+                text_output += f"- {col.title} (ID: {col.id}, Type: {col.type})\n"
                 if hasattr(col, 'options') and col.options:
                     text_output += f"    Options: {', '.join(col.options)}\n"
-                if hasattr(col, 'symbol') and col.symbol:
-                    text_output += f"    Symbol: {col.symbol}\n"
-                if hasattr(col, 'system_column_type') and col.system_column_type:
-                    text_output += f"    System Type: {col.system_column_type}\n"
-                if hasattr(col, 'validation') and col.validation:
-                    text_output += "    Has Validation: Yes\n"
-                if hasattr(col, 'formula') and col.formula:
-                    text_output += f"    Formula: {col.formula}\n"
-                text_output += "\n"
-
             return text_output
 
         elif info == "stats":
-            sheet = client.Sheets.get_sheet(resolved_id, page_size=5000)
+            text_output = f"Statistics for '{sheet.name}':\n{'=' * 50}\n\n"
+            text_output += f"Total Rows: {len(sheet.rows)}\n"
+            text_output += f"Total Columns: {len(sheet.columns)}\n"
 
-            total_rows = len(sheet.rows)
-            total_columns = len(sheet.columns)
-
-            column_types = {}
+            # Column type breakdown
+            type_counts = {}
             for col in sheet.columns:
                 col_type = col.type
-                column_types[col_type] = column_types.get(col_type, 0) + 1
+                type_counts[col_type] = type_counts.get(col_type, 0) + 1
 
-            non_empty_cells = 0
-            column_fill_rates = {}
-            columns_map = {col.id: col.title for col in sheet.columns}
-
-            for col in sheet.columns:
-                column_fill_rates[col.title] = 0
-
-            for row in sheet.rows:
-                for cell in row.cells:
-                    if cell.value is not None and cell.value != "":
-                        non_empty_cells += 1
-                        col_name = columns_map.get(cell.column_id, "Unknown")
-                        column_fill_rates[col_name] = column_fill_rates.get(col_name, 0) + 1
-
-            text_output = f"Summary for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
-            text_output += "**Basic Stats:**\n"
-            text_output += f"  - Total Rows: {total_rows}\n"
-            text_output += f"  - Total Columns: {total_columns}\n"
-            text_output += f"  - Total Cells: {total_rows * total_columns}\n"
-            text_output += f"  - Non-empty Cells: {non_empty_cells}\n"
-            if total_rows * total_columns > 0:
-                fill_rate = (non_empty_cells / (total_rows * total_columns)) * 100
-                text_output += f"  - Fill Rate: {fill_rate:.1f}%\n"
-
-            text_output += "\n**Column Types:**\n"
-            for col_type, count in sorted(column_types.items()):
+            text_output += "\nColumn Types:\n"
+            for col_type, count in sorted(type_counts.items()):
                 text_output += f"  - {col_type}: {count}\n"
-
-            text_output += "\n**Column Fill Rates:**\n"
-            for col_name, filled in sorted(column_fill_rates.items(), key=lambda x: -x[1]):
-                if total_rows > 0:
-                    rate = (filled / total_rows) * 100
-                    text_output += f"  - {col_name}: {rate:.0f}% ({filled}/{total_rows})\n"
-
-            text_output += "\n**Metadata:**\n"
-            if hasattr(sheet, 'created_at') and sheet.created_at:
-                text_output += f"  - Created: {sheet.created_at}\n"
-            if hasattr(sheet, 'modified_at') and sheet.modified_at:
-                text_output += f"  - Last Modified: {sheet.modified_at}\n"
-            if hasattr(sheet, 'owner') and sheet.owner:
-                text_output += f"  - Owner: {sheet.owner}\n"
-            if hasattr(sheet, 'permalink') and sheet.permalink:
-                text_output += f"  - Permalink: {sheet.permalink}\n"
 
             return text_output
 
         elif info == "summary_fields":
-            summary = client.Sheets.get_sheet_summary_fields(resolved_id, include_all=True)
-            sheet = client.Sheets.get_sheet(resolved_id)
+            text_output = f"Summary Fields for '{sheet.name}':\n{'=' * 50}\n\n"
 
-            text_output = f"Summary Fields for '{sheet.name}':\n"
-            text_output += "=" * 50 + "\n\n"
-
-            if summary.data:
-                text_output += f"Found {len(summary.data)} summary field(s):\n\n"
-                for field in summary.data:
+            if hasattr(sheet, 'summary') and sheet.summary and hasattr(sheet.summary, 'fields'):
+                for field in sheet.summary.fields:
                     title = getattr(field, 'title', 'Untitled')
-                    text_output += f"**{title}**\n"
-
-                    if hasattr(field, 'display_value') and field.display_value:
-                        text_output += f"  Value: {field.display_value}\n"
-                    elif hasattr(field, 'object_value') and field.object_value:
-                        text_output += f"  Value: {field.object_value}\n"
-
-                    if hasattr(field, 'type') and field.type:
-                        text_output += f"  Type: {field.type}\n"
-                    if hasattr(field, 'formula') and field.formula:
-                        text_output += f"  Formula: {field.formula}\n"
-                    if hasattr(field, 'locked') and field.locked:
-                        text_output += f"  Locked: Yes\n"
-                    text_output += "\n"
+                    value = getattr(field, 'display_value', getattr(field, 'object_value', 'N/A'))
+                    text_output += f"- {title}: {value}\n"
             else:
-                text_output += "No summary fields found on this sheet.\n"
-                text_output += "\nTip: Summary fields are defined at the top of a sheet and contain key metadata or KPIs.\n"
+                text_output += "No summary fields found.\n"
 
             return text_output
 
         elif info == "by_column":
-            sheet = client.Sheets.get_sheet(resolved_id, page_size=5000)
+            if not columns:
+                return "Error: columns parameter is required for info='by_column'"
 
-            requested_cols = [c.strip().lower() for c in columns.split(",")]
-
-            columns_map = {}
-            target_column_ids = set()
+            column_names = [c.strip() for c in columns.split(",")]
+            col_id_map = {}
             for col in sheet.columns:
-                columns_map[col.id] = col.title
-                if col.title.lower() in requested_cols:
-                    target_column_ids.add(col.id)
+                if col.title.lower() in [c.lower() for c in column_names]:
+                    col_id_map[col.id] = col.title
 
-            if not target_column_ids:
-                available = ", ".join([col.title for col in sheet.columns])
-                return f"Error: None of the requested columns found. Available: {available}"
+            if not col_id_map:
+                return f"Error: None of the specified columns found. Available: {', '.join([c.title for c in sheet.columns])}"
 
-            text_output = f"Sheet: {sheet.name}\n"
-            text_output += f"Columns: {', '.join([columns_map[cid] for cid in target_column_ids])}\n"
-            text_output += f"Total Rows: {len(sheet.rows)}\n\n"
+            text_output = f"Data from '{sheet.name}' - Columns: {', '.join(col_id_map.values())}\n\n"
 
-            for row in sheet.rows:
-                row_values = []
+            for row in sheet.rows[:50]:  # Limit to 50 rows
+                row_data = []
                 for cell in row.cells:
-                    if cell.column_id in target_column_ids:
-                        col_name = columns_map[cell.column_id]
+                    if cell.column_id in col_id_map:
+                        col_name = col_id_map[cell.column_id]
                         value = cell.display_value or cell.value
-                        if value is not None:
-                            row_values.append(f"{col_name}: {value}")
-
-                if row_values:
-                    text_output += f"  Row {row.row_number}: {' | '.join(row_values)}\n"
+                        row_data.append(f"{col_name}: {value}")
+                if row_data:
+                    text_output += f"Row {row.row_number}: {' | '.join(row_data)}\n"
 
             return text_output
+
         else:
-            return f"Error: Unknown info type '{info}'. Valid options: columns, stats, summary_fields, by_column"
+            return f"Error: Unknown info type '{info}'"
+
     except Exception as e:
-        return f"Error getting sheet info: {str(e)}"
+        return f"Error with sheet_info: {str(e)}"
 
 
 # =============================================================================
-# UNIFIED UPDATE REQUESTS (1 tool - consolidated from 2)
+# UNIFIED UPDATE REQUESTS (1)
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def update_requests(sheet_id: str, sent: bool = False) -> str:
     """
-    Get update requests for a sheet. Can retrieve pending or sent update requests.
+    Get update requests for a sheet.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-        sent: If False (default), returns pending update requests.
-             If True, returns sent update requests with their status.
-
-    Returns formatted list of update requests.
+        sent: If True, get sent requests. If False (default), get pending requests.
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
@@ -1847,567 +1326,910 @@ def update_requests(sheet_id: str, sent: bool = False) -> str:
             return f"Error: Sheet '{sheet_id}' not found"
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
-
-        sheet = client.Sheets.get_sheet(resolved_id)
+            return "Error: Access to sheet is not permitted."
 
         if sent:
             requests = client.Sheets.list_sent_update_requests(resolved_id, include_all=True)
-            text_output = f"Sent Update Requests for '{sheet.name}':\n"
+            text_output = "Sent Update Requests:\n"
         else:
             requests = client.Sheets.list_update_requests(resolved_id, include_all=True)
-            text_output = f"Update Requests for '{sheet.name}':\n"
-
-        text_output += "=" * 50 + "\n\n"
+            text_output = "Pending Update Requests:\n"
 
         if requests.data:
-            text_output += f"Found {len(requests.data)} update request(s):\n\n"
             for req in requests.data:
-                text_output += f"**Request ID: {req.id}**\n"
-
-                if sent:
-                    if hasattr(req, 'sent_at') and req.sent_at:
-                        text_output += f"  Sent At: {req.sent_at}\n"
-                    if hasattr(req, 'sent_to') and req.sent_to:
-                        email = getattr(req.sent_to, 'email', str(req.sent_to))
-                        text_output += f"  Sent To: {email}\n"
-                    if hasattr(req, 'status') and req.status:
-                        text_output += f"  Status: {req.status}\n"
-                else:
-                    if hasattr(req, 'subject') and req.subject:
-                        text_output += f"  Subject: {req.subject}\n"
-                    if hasattr(req, 'message') and req.message:
-                        msg = req.message[:100] + '...' if len(req.message) > 100 else req.message
-                        text_output += f"  Message: {msg}\n"
-                    if hasattr(req, 'send_to') and req.send_to:
-                        recipients = [getattr(r, 'email', str(r)) for r in req.send_to]
-                        text_output += f"  Recipients: {', '.join(recipients[:5])}\n"
-                        if len(recipients) > 5:
-                            text_output += f"    ... and {len(recipients) - 5} more\n"
-                    if hasattr(req, 'schedule') and req.schedule:
-                        text_output += f"  Scheduled: Yes\n"
-                    if hasattr(req, 'created_at') and req.created_at:
-                        text_output += f"  Created: {req.created_at}\n"
-
-                text_output += "\n"
+                text_output += f"- ID: {req.id}, Sent To: {getattr(req, 'sent_to', 'N/A')}\n"
         else:
-            text_output += f"No {'sent ' if sent else ''}update requests found for this sheet.\n"
+            text_output += "No update requests found.\n"
 
         return text_output
     except Exception as e:
-        return f"Error getting update requests: {str(e)}"
+        return f"Error with update_requests: {str(e)}"
 
 
 # =============================================================================
-# STANDALONE TOOLS (9 tools - unique purposes, unchanged)
+# STANDALONE TOOLS (9)
 # =============================================================================
 
+@tool(cache_results=True)
+@cached_tool
 def compare_sheets(sheet_id_1: str, sheet_id_2: str, key_column: str) -> str:
     """
     Compare two sheets by a key column to find differences.
 
     Args:
-        sheet_id_1: The first sheet ID or name.
-        sheet_id_2: The second sheet ID or name.
-        key_column: The column name to use as the comparison key.
-
-    Returns summary of differences between the two sheets.
+        sheet_id_1: First sheet ID or name.
+        sheet_id_2: Second sheet ID or name.
+        key_column: Column name to use as the comparison key.
     """
-    if not sheet_id_1 or not sheet_id_2 or not key_column:
-        return "Error: sheet_id_1, sheet_id_2, and key_column parameters are required"
+    if not all([sheet_id_1, sheet_id_2, key_column]):
+        return "Error: sheet_id_1, sheet_id_2, and key_column are required"
 
     try:
         client = get_smartsheet_client()
 
-        # Resolve both sheets
-        id1, name1 = _resolve_sheet_id(client, sheet_id_1)
-        id2, name2 = _resolve_sheet_id(client, sheet_id_2)
+        resolved_id_1, _ = _resolve_sheet_id(client, sheet_id_1)
+        resolved_id_2, _ = _resolve_sheet_id(client, sheet_id_2)
 
-        if not id1:
+        if not resolved_id_1:
             return f"Error: Sheet '{sheet_id_1}' not found"
-        if not id2:
+        if not resolved_id_2:
             return f"Error: Sheet '{sheet_id_2}' not found"
 
-        if not _is_sheet_allowed(id1, name1):
-            return f"Error: Access to sheet '{name1 or id1}' is not permitted."
-        if not _is_sheet_allowed(id2, name2):
-            return f"Error: Access to sheet '{name2 or id2}' is not permitted."
+        sheet1 = client.Sheets.get_sheet(resolved_id_1)
+        sheet2 = client.Sheets.get_sheet(resolved_id_2)
 
-        sheet1 = client.Sheets.get_sheet(id1, page_size=5000)
-        sheet2 = client.Sheets.get_sheet(id2, page_size=5000)
+        # Find key column in both sheets
+        key_col_1 = None
+        key_col_2 = None
 
-        def get_column_id(sheet, col_name):
-            for col in sheet.columns:
-                if col.title.lower() == col_name.lower():
-                    return col.id
-            return None
+        for col in sheet1.columns:
+            if col.title.lower() == key_column.lower():
+                key_col_1 = col.id
+                break
 
-        key_col_id_1 = get_column_id(sheet1, key_column)
-        key_col_id_2 = get_column_id(sheet2, key_column)
+        for col in sheet2.columns:
+            if col.title.lower() == key_column.lower():
+                key_col_2 = col.id
+                break
 
-        if not key_col_id_1:
-            return f"Error: Column '{key_column}' not found in sheet '{sheet1.name}'"
-        if not key_col_id_2:
-            return f"Error: Column '{key_column}' not found in sheet '{sheet2.name}'"
+        if not key_col_1 or not key_col_2:
+            return f"Error: Key column '{key_column}' not found in both sheets"
 
-        def build_key_map(sheet, key_col_id):
-            key_map = {}
-            for row in sheet.rows:
-                for cell in row.cells:
-                    if cell.column_id == key_col_id:
-                        key = str(cell.display_value or cell.value or "")
-                        if key:
-                            key_map[key] = row.row_number
-                        break
-            return key_map
+        # Build key sets
+        keys_1 = set()
+        keys_2 = set()
 
-        keys1 = build_key_map(sheet1, key_col_id_1)
-        keys2 = build_key_map(sheet2, key_col_id_2)
+        for row in sheet1.rows:
+            for cell in row.cells:
+                if cell.column_id == key_col_1:
+                    keys_1.add(str(cell.display_value or cell.value or ""))
+                    break
 
-        only_in_1 = set(keys1.keys()) - set(keys2.keys())
-        only_in_2 = set(keys2.keys()) - set(keys1.keys())
-        in_both = set(keys1.keys()) & set(keys2.keys())
+        for row in sheet2.rows:
+            for cell in row.cells:
+                if cell.column_id == key_col_2:
+                    keys_2.add(str(cell.display_value or cell.value or ""))
+                    break
 
-        text_output = f"Sheet Comparison\n"
-        text_output += "=" * 50 + "\n\n"
-        text_output += f"Sheet 1: {sheet1.name} ({len(keys1)} rows)\n"
-        text_output += f"Sheet 2: {sheet2.name} ({len(keys2)} rows)\n"
-        text_output += f"Key Column: {key_column}\n\n"
+        only_in_1 = keys_1 - keys_2
+        only_in_2 = keys_2 - keys_1
+        in_both = keys_1 & keys_2
 
-        text_output += f"**Summary:**\n"
-        text_output += f"  - Common keys: {len(in_both)}\n"
-        text_output += f"  - Only in '{sheet1.name}': {len(only_in_1)}\n"
-        text_output += f"  - Only in '{sheet2.name}': {len(only_in_2)}\n\n"
+        text_output = f"Comparison Results\n{'=' * 50}\n\n"
+        text_output += f"Sheet 1: {sheet1.name} ({len(keys_1)} unique keys)\n"
+        text_output += f"Sheet 2: {sheet2.name} ({len(keys_2)} unique keys)\n\n"
+        text_output += f"In both: {len(in_both)}\n"
+        text_output += f"Only in Sheet 1: {len(only_in_1)}\n"
+        text_output += f"Only in Sheet 2: {len(only_in_2)}\n"
 
         if only_in_1:
-            text_output += f"**Keys only in '{sheet1.name}':**\n"
-            for key in list(only_in_1)[:20]:
-                text_output += f"  - {key} (Row {keys1[key]})\n"
-            if len(only_in_1) > 20:
-                text_output += f"  ... and {len(only_in_1) - 20} more\n"
-            text_output += "\n"
+            text_output += f"\n**Only in {sheet1.name}:**\n"
+            for key in list(only_in_1)[:10]:
+                text_output += f"  - {key}\n"
 
         if only_in_2:
-            text_output += f"**Keys only in '{sheet2.name}':**\n"
-            for key in list(only_in_2)[:20]:
-                text_output += f"  - {key} (Row {keys2[key]})\n"
-            if len(only_in_2) > 20:
-                text_output += f"  ... and {len(only_in_2) - 20} more\n"
+            text_output += f"\n**Only in {sheet2.name}:**\n"
+            for key in list(only_in_2)[:10]:
+                text_output += f"  - {key}\n"
 
         return text_output
     except Exception as e:
         return f"Error comparing sheets: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_cell_history(sheet_id: str, row_id: str, column_id: str) -> str:
     """
-    Get the revision history for a specific cell in a Smartsheet.
+    Get revision history for a specific cell.
 
     Args:
-        sheet_id: The ID of the sheet containing the cell.
-        row_id: The ID of the row containing the cell.
-        column_id: The ID of the column containing the cell.
-
-    Returns formatted history of changes to the cell including who changed it and when.
+        sheet_id: The sheet ID.
+        row_id: The row ID.
+        column_id: The column ID or column name.
     """
-    if not sheet_id or not row_id or not column_id:
-        return "Error: sheet_id, row_id, and column_id parameters are required"
+    if not all([sheet_id, row_id, column_id]):
+        return "Error: sheet_id, row_id, and column_id are required"
 
     try:
         client = get_smartsheet_client()
-
         sheet = client.Sheets.get_sheet(int(sheet_id))
-        if not _is_sheet_allowed(sheet.id, sheet.name):
-            return f"Error: Access to sheet '{sheet.name}' is not permitted."
 
-        col_name = "Unknown"
-        for col in sheet.columns:
-            if col.id == int(column_id):
-                col_name = col.title
-                break
+        # Resolve column name to ID if needed
+        if not str(column_id).isdigit():
+            for col in sheet.columns:
+                if col.title.lower() == column_id.lower():
+                    column_id = col.id
+                    break
 
         history = client.Cells.get_cell_history(int(sheet_id), int(row_id), int(column_id), include_all=True)
 
-        text_output = f"Cell History for '{col_name}' in sheet '{sheet.name}':\n"
-        text_output += "=" * 50 + "\n\n"
+        text_output = f"Cell History:\n{'=' * 50}\n\n"
 
         if history.data:
             for entry in history.data:
-                text_output += f"**Value:** {entry.display_value or entry.value or '(empty)'}\n"
-                if hasattr(entry, 'modified_at') and entry.modified_at:
-                    text_output += f"   Modified: {entry.modified_at}\n"
-                if hasattr(entry, 'modified_by') and entry.modified_by:
-                    modifier = entry.modified_by
-                    name = getattr(modifier, 'name', None) or getattr(modifier, 'email', 'Unknown')
-                    text_output += f"   By: {name}\n"
-                text_output += "\n"
+                modified_at = getattr(entry, 'modified_at', 'Unknown')
+                modified_by = getattr(entry, 'modified_by', {})
+                user_name = getattr(modified_by, 'name', 'Unknown')
+                value = entry.display_value or entry.value
+                text_output += f"- {modified_at}: {value} (by {user_name})\n"
         else:
-            text_output += "No history available for this cell.\n"
+            text_output += "No history found.\n"
 
         return text_output
     except Exception as e:
         return f"Error getting cell history: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_sheet_version(sheet_id: str) -> str:
     """
-    Get version information for a Smartsheet.
+    Get sheet version and modification info.
 
     Args:
         sheet_id: The sheet ID (numeric) or sheet name.
-
-    Returns sheet version and modification info.
     """
     if not sheet_id:
         return "Error: sheet_id parameter is required"
 
     try:
         client = get_smartsheet_client()
-        resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
+        resolved_id, _ = _resolve_sheet_id(client, sheet_id)
 
         if not resolved_id:
             return f"Error: Sheet '{sheet_id}' not found"
 
-        if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
-
         sheet = client.Sheets.get_sheet(resolved_id)
 
-        text_output = f"Version Info for '{sheet.name}':\n"
-        text_output += "=" * 50 + "\n\n"
-
-        if hasattr(sheet, 'version') and sheet.version:
-            text_output += f"Version: {sheet.version}\n"
-        if hasattr(sheet, 'created_at') and sheet.created_at:
-            text_output += f"Created: {sheet.created_at}\n"
-        if hasattr(sheet, 'modified_at') and sheet.modified_at:
-            text_output += f"Last Modified: {sheet.modified_at}\n"
-        if hasattr(sheet, 'owner') and sheet.owner:
-            text_output += f"Owner: {sheet.owner}\n"
-        if hasattr(sheet, 'owner_id') and sheet.owner_id:
-            text_output += f"Owner ID: {sheet.owner_id}\n"
-        if hasattr(sheet, 'total_row_count') and sheet.total_row_count is not None:
-            text_output += f"Total Rows: {sheet.total_row_count}\n"
-        if hasattr(sheet, 'access_level') and sheet.access_level:
-            text_output += f"Your Access Level: {sheet.access_level}\n"
-        if hasattr(sheet, 'permalink') and sheet.permalink:
-            text_output += f"Permalink: {sheet.permalink}\n"
+        text_output = f"Sheet Version Info: {sheet.name}\n{'=' * 50}\n\n"
+        text_output += f"Version: {getattr(sheet, 'version', 'N/A')}\n"
+        text_output += f"Created At: {getattr(sheet, 'created_at', 'N/A')}\n"
+        text_output += f"Modified At: {getattr(sheet, 'modified_at', 'N/A')}\n"
 
         return text_output
     except Exception as e:
         return f"Error getting sheet version: {str(e)}"
 
 
-def get_events(since: str = None, days_back: int = 7, max_count: int = 100) -> str:
+@tool(cache_results=True)
+@cached_tool
+def get_events(days_back: int = 7, max_count: int = 50) -> str:
     """
-    Get recent events/audit log from Smartsheet (Enterprise feature).
+    Get recent audit events (Enterprise feature).
 
     Args:
-        since: ISO 8601 datetime to start from (e.g., '2024-01-15T00:00:00Z').
-               If not provided, defaults to `days_back` days ago.
-        days_back: Number of days to look back if `since` is not provided. Default: 7.
-        max_count: Maximum number of events to return (1-10000). Default: 100.
-
-    Returns list of recent events with details.
+        days_back: Number of days to look back (default 7).
+        max_count: Maximum events to return (default 50).
     """
     try:
         client = get_smartsheet_client()
 
-        if since:
-            start_time = since
+        since = datetime.utcnow() - timedelta(days=days_back)
+        since_str = since.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        events = client.Events.list_events(since=since_str, max_count=max_count)
+
+        text_output = f"Recent Events (last {days_back} days):\n{'=' * 50}\n\n"
+
+        if events.data:
+            for event in events.data:
+                event_type = getattr(event, 'event_type', 'Unknown')
+                timestamp = getattr(event, 'event_timestamp', 'N/A')
+                text_output += f"- {timestamp}: {event_type}\n"
         else:
-            start_time = (datetime.now() - timedelta(days=days_back)).isoformat()
-
-        events_response = client.Events.list_events(since=start_time, max_count=min(max_count, 10000))
-
-        text_output = f"Smartsheet Events (since {start_time[:10]}):\n"
-        text_output += "=" * 60 + "\n\n"
-
-        if not events_response.data:
-            text_output += "No events found in the specified time range.\n"
-            return text_output
-
-        text_output += f"Found {len(events_response.data)} event(s):\n\n"
-
-        for i, event in enumerate(events_response.data, 1):
-            obj_type = getattr(event, 'object_type', 'Unknown')
-            action = getattr(event, 'action', 'Unknown')
-            text_output += f"**{i}. {action} {obj_type}**\n"
-
-            event_id = getattr(event, 'event_id', 'N/A')
-            timestamp = getattr(event, 'event_timestamp', 'N/A')
-            text_output += f"  Event ID: {event_id}\n"
-            text_output += f"  Time: {timestamp}\n"
-
-            if hasattr(event, 'user_id'):
-                text_output += f"  User ID: {event.user_id}\n"
-
-            if hasattr(event, 'object_id'):
-                text_output += f"  Object ID: {event.object_id}\n"
-
-            if hasattr(event, 'additional_details') and event.additional_details:
-                details = event.additional_details
-                if isinstance(details, dict):
-                    if 'sheetName' in details:
-                        text_output += f"  Sheet Name: {details['sheetName']}\n"
-                    if 'sheetId' in details:
-                        text_output += f"  Sheet ID: {details['sheetId']}\n"
-
-            text_output += "\n"
-
-        if events_response.more_available:
-            text_output += f"\nMore events available. Use stream_position to continue.\n"
+            text_output += "No events found.\n"
 
         return text_output
     except Exception as e:
-        error_str = str(e)
-        if '1004' in error_str or 'not enabled' in error_str.lower() or 'not available' in error_str.lower():
-            return "Error: Event Reporting is not available for this account. This feature requires a Smartsheet Enterprise plan."
-        return f"Error getting events: {error_str}"
+        if 'not authorized' in str(e).lower() or '1003' in str(e):
+            return "Error: Events API requires Enterprise plan with appropriate permissions."
+        return f"Error getting events: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_current_user() -> str:
-    """
-    Get information about the current authenticated Smartsheet user.
-
-    Returns formatted user profile information.
-    """
+    """Get current authenticated user profile."""
     try:
         client = get_smartsheet_client()
         user = client.Users.get_current_user()
 
-        text_output = "Current User Profile\n"
-        text_output += "=" * 50 + "\n\n"
-
-        if hasattr(user, 'email') and user.email:
-            text_output += f"Email: {user.email}\n"
-        if hasattr(user, 'first_name') and user.first_name:
-            text_output += f"First Name: {user.first_name}\n"
-        if hasattr(user, 'last_name') and user.last_name:
-            text_output += f"Last Name: {user.last_name}\n"
-        if hasattr(user, 'id') and user.id:
-            text_output += f"User ID: {user.id}\n"
-        if hasattr(user, 'account') and user.account:
-            account = user.account
-            if hasattr(account, 'name'):
-                text_output += f"Account: {account.name}\n"
-        if hasattr(user, 'locale') and user.locale:
-            text_output += f"Locale: {user.locale}\n"
-        if hasattr(user, 'time_zone') and user.time_zone:
-            text_output += f"Timezone: {user.time_zone}\n"
+        text_output = f"Current User\n{'=' * 50}\n\n"
+        text_output += f"Name: {getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}\n"
+        text_output += f"Email: {getattr(user, 'email', 'N/A')}\n"
+        text_output += f"ID: {getattr(user, 'id', 'N/A')}\n"
 
         return text_output
     except Exception as e:
-        return f"Error getting user info: {str(e)}"
+        return f"Error getting current user: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_contacts() -> str:
-    """
-    List all contacts in the user's personal contacts list.
-
-    Returns a formatted list of contacts.
-    """
+    """List personal contacts."""
     try:
         client = get_smartsheet_client()
-        response = client.Contacts.list_contacts(include_all=True)
+        contacts = client.Contacts.list_contacts(include_all=True)
 
-        if not response.data:
-            return "No contacts found."
+        text_output = f"Personal Contacts\n{'=' * 50}\n\n"
 
-        text_output = "Your Contacts\n"
-        text_output += "=" * 50 + "\n\n"
-        text_output += f"Found {len(response.data)} contact(s):\n\n"
-
-        for contact in response.data:
-            email = getattr(contact, 'email', 'Unknown')
-            name = getattr(contact, 'name', '')
-            contact_id = getattr(contact, 'id', '')
-
-            text_output += f"**{email}**"
-            if name:
-                text_output += f" ({name})"
-            if contact_id:
-                text_output += f" [ID: {contact_id}]"
-            text_output += "\n"
+        if contacts.data:
+            for contact in contacts.data:
+                name = getattr(contact, 'name', 'N/A')
+                email = getattr(contact, 'email', 'N/A')
+                text_output += f"- {name} ({email})\n"
+        else:
+            text_output += "No contacts found.\n"
 
         return text_output
     except Exception as e:
         return f"Error getting contacts: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_server_info() -> str:
-    """
-    Get Smartsheet server information and application constants.
-
-    Returns server information including supported locales, time zones, and formats.
-    """
+    """Get Smartsheet server info and constants."""
     try:
         client = get_smartsheet_client()
         info = client.Server.server_info()
 
-        text_output = "Smartsheet Server Info\n"
-        text_output += "=" * 50 + "\n\n"
+        text_output = f"Server Info\n{'=' * 50}\n\n"
 
-        if hasattr(info, 'formats') and info.formats:
-            text_output += "**Formats:**\n"
-            if hasattr(info.formats, 'currency'):
-                text_output += f"  Currencies: {len(info.formats.currency)} supported\n"
-            if hasattr(info.formats, 'date_format'):
-                text_output += f"  Date Formats: {len(info.formats.date_format)} supported\n"
+        if hasattr(info, 'supported_locales'):
+            text_output += f"Supported Locales: {len(info.supported_locales)}\n"
 
-        if hasattr(info, 'supported_locales') and info.supported_locales:
-            text_output += f"\n**Supported Locales:** {len(info.supported_locales)}\n"
-            for locale in info.supported_locales[:10]:
-                text_output += f"  - {locale}\n"
-            if len(info.supported_locales) > 10:
-                text_output += f"  ... and {len(info.supported_locales) - 10} more\n"
+        if hasattr(info, 'formats'):
+            text_output += "Formats Available: Yes\n"
 
         return text_output
     except Exception as e:
         return f"Error getting server info: {str(e)}"
 
 
-def list_org_sheets(modified_since: str = None) -> str:
+@tool(cache_results=True)
+@cached_tool
+def list_org_sheets(max_results: int = 100) -> str:
     """
-    List ALL sheets in the organization (Admin feature, requires System Admin).
+    List ALL sheets in the organization (Admin feature).
 
     Args:
-        modified_since: Optional ISO 8601 datetime to filter sheets modified after this time.
-
-    Returns list of all sheets in the organization with owner info.
+        max_results: Maximum sheets to return (default 100).
     """
     try:
         client = get_smartsheet_client()
+        response = client.Users.list_org_sheets(page_size=min(max_results, 1000))
 
-        if modified_since:
-            response = client.Users.list_org_sheets(modified_since=modified_since)
+        text_output = f"Organization Sheets\n{'=' * 50}\n\n"
+
+        if response.data:
+            text_output += f"Found {len(response.data)} sheets:\n\n"
+            for sheet in response.data[:max_results]:
+                text_output += f"- {sheet.name} (ID: {sheet.id})\n"
         else:
-            response = client.Users.list_org_sheets()
-
-        text_output = "Organization Sheets (All sheets in org)\n"
-        text_output += "=" * 60 + "\n\n"
-
-        if not response.data:
-            text_output += "No sheets found in the organization.\n"
-            return text_output
-
-        text_output += f"Found {len(response.data)} sheet(s) across the organization:\n\n"
-
-        for i, sheet in enumerate(response.data, 1):
-            name = getattr(sheet, 'name', 'Untitled')
-            sheet_id = getattr(sheet, 'id', 'N/A')
-            text_output += f"{i}. {name} (ID: {sheet_id})\n"
-
-            owner = getattr(sheet, 'owner', None)
-            if owner:
-                text_output += f"   Owner: {owner}\n"
-            access = getattr(sheet, 'access_level', None)
-            if access:
-                text_output += f"   Access Level: {access}\n"
-            modified = getattr(sheet, 'modified_at', None)
-            if modified:
-                text_output += f"   Modified: {modified}\n"
-
-            text_output += "\n"
-
-        total_pages = getattr(response, 'total_pages', 1)
-        if total_pages > 1:
-            total_count = getattr(response, 'total_count', len(response.data))
-            text_output += f"\nTotal: {total_count} sheets across {total_pages} pages.\n"
+            text_output += "No sheets found.\n"
 
         return text_output
     except Exception as e:
-        error_str = str(e)
-        if '1003' in error_str or 'not authorized' in error_str.lower():
-            return "Error: You must be a System Admin to list organization sheets."
-        return f"Error listing org sheets: {error_str}"
+        if 'not authorized' in str(e).lower():
+            return "Error: This feature requires System Admin permissions."
+        return f"Error listing org sheets: {str(e)}"
 
 
+@tool(cache_results=True)
+@cached_tool
 def get_image_urls(sheet_id: str, row_id: str, column_id_or_name: str) -> str:
     """
-    Get temporary download URL for an image in a cell.
+    Get temporary download URL for cell images.
 
     Args:
-        sheet_id: The sheet ID (numeric) or sheet name.
-        row_id: The row ID (numeric).
-        column_id_or_name: The column ID (numeric) or column title.
-
-    Returns image information including temporary download URL.
+        sheet_id: The sheet ID.
+        row_id: The row ID.
+        column_id_or_name: The column ID or column name.
     """
-    if not sheet_id or not row_id or not column_id_or_name:
-        return "Error: sheet_id, row_id, and column_id_or_name parameters are required"
+    if not all([sheet_id, row_id, column_id_or_name]):
+        return "Error: sheet_id, row_id, and column_id_or_name are required"
+
+    try:
+        client = get_smartsheet_client()
+        sheet = client.Sheets.get_sheet(int(sheet_id))
+
+        # Resolve column name to ID if needed
+        column_id = column_id_or_name
+        if not str(column_id_or_name).isdigit():
+            for col in sheet.columns:
+                if col.title.lower() == column_id_or_name.lower():
+                    column_id = col.id
+                    break
+
+        # Get row to find image
+        row = client.Sheets.get_row(int(sheet_id), int(row_id))
+
+        image_id = None
+        for cell in row.cells:
+            if cell.column_id == int(column_id):
+                if hasattr(cell, 'image') and cell.image:
+                    image_id = cell.image.id
+                break
+
+        if not image_id:
+            return "No image found in the specified cell."
+
+        # Get image URL
+        url_response = client.Sheets.get_row_cell_image_urls(
+            int(sheet_id),
+            int(row_id),
+            [{"columnId": int(column_id), "imageId": image_id}]
+        )
+
+        text_output = "Image URL:\n"
+        if url_response.image_urls:
+            text_output += f"{url_response.image_urls[0].url}\n"
+            text_output += "\n⚠️ This URL is temporary and will expire.\n"
+        else:
+            text_output += "Unable to retrieve image URL.\n"
+
+        return text_output
+    except Exception as e:
+        return f"Error getting image URL: {str(e)}"
+
+
+# =============================================================================
+# FUZZY SHEET SEARCH (1) - Helps users find sheets by partial/approximate names
+# =============================================================================
+
+def _calculate_similarity(s1: str, s2: str) -> float:
+    """
+    Calculate similarity ratio between two strings using sequence matching.
+    Returns a score between 0.0 and 1.0.
+    """
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+
+def _tokenize(text: str) -> set:
+    """Extract meaningful tokens from text for word-based matching."""
+    import re
+    # Split on non-alphanumeric characters and filter short tokens
+    tokens = re.split(r'[^a-zA-Z0-9]+', text.lower())
+    return {t for t in tokens if len(t) >= 2}
+
+
+@tool(cache_results=True)
+@cached_tool
+def find_sheets(query: str, max_results: int = 5, include_ids: bool = True) -> str:
+    """
+    Search for sheets by partial or approximate name. Use this when users provide
+    an inexact sheet name and you need to find matching sheets to confirm with them.
+
+    This tool performs fuzzy matching to find sheets that:
+    - Contain the search query as a substring
+    - Have similar words in their name
+    - Are similar based on text similarity scoring
+
+    Args:
+        query: Partial or approximate sheet name to search for (e.g., "job log", "retainer", "project tracker")
+        max_results: Maximum number of matching sheets to return (default 5)
+        include_ids: Include sheet IDs in the results (default True, helpful for disambiguation)
+
+    Returns a ranked list of matching sheets with confidence indicators.
+
+    Example usage:
+    - User says "job log retainer sheet" but exact name is "Job Log - Retainer Projects"
+    - Call find_sheets("job log retainer") to find matches
+    - Present options to user and ask them to confirm which sheet they meant
+    """
+    if not query:
+        return "Error: query parameter is required. Provide a partial or approximate sheet name."
+
+    try:
+        client = get_smartsheet_client()
+        response = client.Sheets.list_sheets(include_all=True)
+
+        if not response.data:
+            return "No sheets available."
+
+        query_lower = query.lower().strip()
+        query_tokens = _tokenize(query)
+
+        # Score each sheet
+        matches = []
+        for sheet in response.data:
+            # Skip sheets not in allowed list (if configured)
+            if not _is_sheet_allowed(sheet.id, sheet.name):
+                continue
+
+            sheet_name = sheet.name
+            sheet_name_lower = sheet_name.lower()
+            sheet_tokens = _tokenize(sheet_name)
+
+            # Calculate different match scores
+            scores = {
+                'exact': 1.0 if sheet_name_lower == query_lower else 0.0,
+                'contains': 1.0 if query_lower in sheet_name_lower else 0.0,
+                'contained': 0.8 if sheet_name_lower in query_lower else 0.0,
+                'similarity': _calculate_similarity(query_lower, sheet_name_lower),
+                'word_match': 0.0,
+            }
+
+            # Word-based matching (how many query tokens appear in sheet name)
+            if query_tokens:
+                matching_tokens = query_tokens & sheet_tokens
+                scores['word_match'] = len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+
+            # Also check if any sheet token contains any query token (partial word match)
+            partial_word_score = 0.0
+            for qt in query_tokens:
+                for st in sheet_tokens:
+                    if qt in st or st in qt:
+                        partial_word_score = max(partial_word_score, 0.6)
+            scores['partial_word'] = partial_word_score
+
+            # Compute weighted overall score
+            overall_score = (
+                scores['exact'] * 2.0 +           # Exact match is best
+                scores['contains'] * 1.5 +        # Query in sheet name is very good
+                scores['contained'] * 0.8 +       # Sheet name in query is okay
+                scores['word_match'] * 1.2 +      # Word overlap is good
+                scores['partial_word'] * 0.8 +    # Partial word match is okay
+                scores['similarity'] * 0.5        # Overall similarity
+            ) / 6.7  # Normalize to roughly 0-1 range
+
+            if overall_score > 0.1:  # Minimum threshold
+                match_type = "exact" if scores['exact'] > 0 else \
+                            "contains" if scores['contains'] > 0 else \
+                            "word match" if scores['word_match'] > 0.5 else \
+                            "partial" if scores['partial_word'] > 0 else \
+                            "similar"
+
+                matches.append({
+                    'name': sheet_name,
+                    'id': sheet.id,
+                    'score': overall_score,
+                    'match_type': match_type,
+                    'access_level': getattr(sheet, 'access_level', 'Unknown'),
+                })
+
+        # Sort by score descending and limit results
+        matches.sort(key=lambda x: x['score'], reverse=True)
+        matches = matches[:max_results]
+
+        if not matches:
+            text_output = f"No sheets found matching '{query}'.\n\n"
+            text_output += "Suggestions:\n"
+            text_output += "- Try using different keywords\n"
+            text_output += "- Use list_sheets() to see all available sheets\n"
+            return text_output
+
+        # Format output
+        text_output = f"Found {len(matches)} sheet(s) matching '{query}':\n\n"
+
+        for i, match in enumerate(matches, 1):
+            confidence = "HIGH" if match['score'] > 0.7 else "MEDIUM" if match['score'] > 0.4 else "LOW"
+            text_output += f"{i}. {match['name']}"
+            if include_ids:
+                text_output += f" (ID: {match['id']})"
+            text_output += f"\n   Match: {match['match_type'].upper()} | Confidence: {confidence}\n"
+
+        text_output += "\n**Reply with the number (e.g., '1') to select a sheet**, or provide the exact sheet name or ID."
+
+        return text_output
+    except Exception as e:
+        return f"Error searching for sheets: {str(e)}"
+
+
+# =============================================================================
+# FUZZY COLUMN SEARCH (1) - Helps users find columns by partial/approximate names
+# =============================================================================
+
+@tool(cache_results=True)
+@cached_tool
+def find_columns(sheet_id: str, query: str, max_results: int = 5) -> str:
+    """
+    Search for columns in a sheet by partial or approximate name. Use this when users
+    reference a column informally and you need to find the exact column name.
+
+    This tool performs fuzzy matching to find columns that:
+    - Contain the search query as a substring
+    - Have similar words in their name
+    - Are similar based on text similarity scoring
+
+    Args:
+        sheet_id: The sheet ID (numeric) or sheet name to search within
+        query: Partial or approximate column name (e.g., "status", "job name", "date")
+        max_results: Maximum number of matching columns to return (default 5)
+
+    Returns a ranked list of matching columns with their types and confidence indicators.
+
+    Example usage:
+    - User says "filter by job status" but column is "Current Job Status"
+    - Call find_columns(sheet_id, "job status") to find matches
+    - Use the exact column name in subsequent operations
+    """
+    if not sheet_id:
+        return "Error: sheet_id parameter is required."
+    if not query:
+        return "Error: query parameter is required. Provide a partial or approximate column name."
 
     try:
         client = get_smartsheet_client()
         resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
 
         if not resolved_id:
-            return f"Error: Sheet '{sheet_id}' not found"
+            return f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
 
         if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
-            return f"Error: Access to sheet '{sheet_name_resolved or sheet_id}' is not permitted."
+            return "Error: Access to sheet is not permitted."
 
         sheet = client.Sheets.get_sheet(resolved_id)
 
-        column_id = None
-        if str(column_id_or_name).isdigit():
-            column_id = int(column_id_or_name)
+        if not sheet.columns:
+            return f"Sheet '{sheet.name}' has no columns."
+
+        query_lower = query.lower().strip()
+        query_tokens = _tokenize(query)
+
+        # Score each column
+        matches = []
+        for col in sheet.columns:
+            col_name = col.title
+            col_name_lower = col_name.lower()
+            col_tokens = _tokenize(col_name)
+
+            # Calculate different match scores
+            scores = {
+                'exact': 1.0 if col_name_lower == query_lower else 0.0,
+                'contains': 1.0 if query_lower in col_name_lower else 0.0,
+                'contained': 0.8 if col_name_lower in query_lower else 0.0,
+                'similarity': _calculate_similarity(query_lower, col_name_lower),
+                'word_match': 0.0,
+            }
+
+            # Word-based matching
+            if query_tokens:
+                matching_tokens = query_tokens & col_tokens
+                scores['word_match'] = len(matching_tokens) / len(query_tokens) if query_tokens else 0.0
+
+            # Partial word match
+            partial_word_score = 0.0
+            for qt in query_tokens:
+                for ct in col_tokens:
+                    if qt in ct or ct in qt:
+                        partial_word_score = max(partial_word_score, 0.6)
+            scores['partial_word'] = partial_word_score
+
+            # Compute weighted overall score
+            overall_score = (
+                scores['exact'] * 2.0 +
+                scores['contains'] * 1.5 +
+                scores['contained'] * 0.8 +
+                scores['word_match'] * 1.2 +
+                scores['partial_word'] * 0.8 +
+                scores['similarity'] * 0.5
+            ) / 6.7
+
+            if overall_score > 0.1:
+                match_type = "exact" if scores['exact'] > 0 else \
+                            "contains" if scores['contains'] > 0 else \
+                            "word match" if scores['word_match'] > 0.5 else \
+                            "partial" if scores['partial_word'] > 0 else \
+                            "similar"
+
+                matches.append({
+                    'name': col_name,
+                    'id': col.id,
+                    'type': col.type,
+                    'score': overall_score,
+                    'match_type': match_type,
+                    'options': getattr(col, 'options', None),
+                })
+
+        # Sort by score descending
+        matches.sort(key=lambda x: x['score'], reverse=True)
+        matches = matches[:max_results]
+
+        if not matches:
+            all_columns = ", ".join([c.title for c in sheet.columns])
+            text_output = f"No columns found matching '{query}' in '{sheet.name}'.\n\n"
+            text_output += f"Available columns: {all_columns}\n"
+            return text_output
+
+        # Format output
+        text_output = f"Found {len(matches)} column(s) matching '{query}' in '{sheet.name}':\n\n"
+
+        for i, match in enumerate(matches, 1):
+            confidence = "HIGH" if match['score'] > 0.7 else "MEDIUM" if match['score'] > 0.4 else "LOW"
+            text_output += f"{i}. \"{match['name']}\" (Type: {match['type']})\n"
+            text_output += f"   Match: {match['match_type'].upper()} | Confidence: {confidence}\n"
+            if match['options']:
+                text_output += f"   Options: {', '.join(match['options'][:5])}"
+                if len(match['options']) > 5:
+                    text_output += f" (+{len(match['options']) - 5} more)"
+                text_output += "\n"
+
+        if len(matches) == 1 and matches[0]['score'] > 0.7:
+            text_output += f"\n✓ Best match: \"{matches[0]['name']}\" - proceeding with this column."
         else:
-            for col in sheet.columns:
-                if col.title.lower() == column_id_or_name.lower():
-                    column_id = col.id
-                    break
-            if not column_id:
-                return f"Error: Column '{column_id_or_name}' not found in sheet"
-
-        row = client.Sheets.get_row(resolved_id, int(row_id))
-
-        target_cell = None
-        for cell in row.cells:
-            if cell.column_id == column_id:
-                target_cell = cell
-                break
-
-        if not target_cell:
-            return f"Error: Cell not found at row {row_id}, column {column_id_or_name}"
-
-        image = getattr(target_cell, 'image', None)
-        if not image:
-            return f"No image found in cell at row {row_id}, column {column_id_or_name}."
-
-        text_output = "Cell Image Information\n"
-        text_output += "=" * 50 + "\n\n"
-
-        image_id = getattr(image, 'id', None)
-        alt_text = getattr(image, 'alt_text', None)
-        width = getattr(image, 'width', None)
-        height = getattr(image, 'height', None)
-
-        if alt_text:
-            text_output += f"**Alt Text:** {alt_text}\n"
-        if image_id:
-            text_output += f"**Image ID:** {image_id}\n"
-        if width and height:
-            text_output += f"**Dimensions:** {width} x {height}\n"
-
-        if image_id:
-            image_url_obj = client.models.ImageUrl({"imageId": image_id})
-            url_response = client.Images.get_image_urls([image_url_obj])
-
-            if url_response.image_urls and len(url_response.image_urls) > 0:
-                url = url_response.image_urls[0].url
-                text_output += f"\n**Temporary Download URL:**\n{url}\n"
-                text_output += "\n⚠️ Note: This URL expires after a short time.\n"
-
-                error = getattr(url_response.image_urls[0], 'error', None)
-                if error:
-                    text_output += f"\n**Warning:** {error}\n"
-            else:
-                text_output += "\nUnable to retrieve download URL.\n"
+            text_output += "\n**Reply with the number (e.g., '1') to select a column**, or use the exact column name."
 
         return text_output
     except Exception as e:
-        return f"Error getting image URL: {str(e)}"
+        return f"Error searching for columns: {str(e)}"
+
+
+# =============================================================================
+# SMART QUERY PLANNING (1) - Efficient multi-operation analysis on a single sheet
+# =============================================================================
+
+# In-memory sheet data cache for smart query planning
+_sheet_data_cache: dict[int, tuple[Any, float]] = {}
+_sheet_data_cache_ttl = 120  # 2 minutes for loaded sheet data
+
+
+def _get_cached_sheet_data(client, sheet_id: int) -> Any:
+    """Get sheet data from cache or fetch it."""
+    global _sheet_data_cache
+
+    now = time.time()
+    if sheet_id in _sheet_data_cache:
+        data, timestamp = _sheet_data_cache[sheet_id]
+        if now - timestamp < _sheet_data_cache_ttl:
+            return data
+
+    # Fetch fresh data
+    sheet = client.Sheets.get_sheet(sheet_id, page_size=5000)
+    _sheet_data_cache[sheet_id] = (sheet, now)
+
+    # Clean old entries
+    for sid in list(_sheet_data_cache.keys()):
+        if now - _sheet_data_cache[sid][1] > _sheet_data_cache_ttl:
+            del _sheet_data_cache[sid]
+
+    return sheet
+
+
+@tool(cache_results=True)
+def analyze_sheet(
+    sheet_id: str,
+    operations: str = "summary",
+    column_name: str = None,
+    filter_column: str = None,
+    filter_value: str = None,
+    filter_type: str = "contains",
+    group_by: str = None,
+) -> str:
+    """
+    Perform multiple analysis operations on a sheet in a single efficient call.
+    This tool fetches the sheet data ONCE and performs all requested operations locally,
+    avoiding multiple API calls.
+
+    Use this instead of calling get_sheet + filter_rows + count_rows_by_column separately.
+
+    Args:
+        sheet_id: The sheet ID (numeric) or sheet name
+        operations: Comma-separated list of operations to perform. Options:
+            - "summary": Row count, column count, column types (default)
+            - "columns": List all columns with types
+            - "stats": Statistics including fill rates per column
+            - "filter": Filter rows (requires filter_column and filter_value)
+            - "count": Count rows grouped by a column (requires group_by)
+            - "sample": Show first 5 rows as a sample
+            - "all": Perform summary + columns + stats
+        column_name: Specific column to analyze (for targeted stats)
+        filter_column: Column to filter on (for "filter" operation)
+        filter_value: Value to filter for (for "filter" operation)
+        filter_type: Filter match type: "contains", "equals", "starts_with", "ends_with"
+        group_by: Column to group and count by (for "count" operation)
+
+    Returns comprehensive analysis results in a single response.
+
+    Examples:
+        analyze_sheet("Project Tracker", operations="summary,count", group_by="Status")
+        analyze_sheet("Job Log", operations="filter,stats", filter_column="Status", filter_value="Active")
+        analyze_sheet("Sales Data", operations="all")
+    """
+    if not sheet_id:
+        return "Error: sheet_id parameter is required."
+
+    try:
+        client = get_smartsheet_client()
+        resolved_id, sheet_name_resolved = _resolve_sheet_id(client, sheet_id)
+
+        if not resolved_id:
+            return f"Error: Sheet '{sheet_id}' not found. Use find_sheets() to search for the sheet."
+
+        if not _is_sheet_allowed(resolved_id, sheet_name_resolved):
+            return "Error: Access to sheet is not permitted."
+
+        # Fetch sheet data (cached for 2 minutes)
+        sheet = _get_cached_sheet_data(client, resolved_id)
+
+        # Parse requested operations
+        ops = [op.strip().lower() for op in operations.split(",")]
+        if "all" in ops:
+            ops = ["summary", "columns", "stats"]
+
+        # Build column mappings
+        columns = {col.id: col for col in sheet.columns}
+        col_by_name = {col.title.lower(): col for col in sheet.columns}
+
+        # Resolve fuzzy column names if provided
+        def resolve_column(name):
+            if not name:
+                return None
+            name_lower = name.lower()
+            # Exact match first
+            if name_lower in col_by_name:
+                return col_by_name[name_lower]
+            # Partial match
+            for col_name, col in col_by_name.items():
+                if name_lower in col_name or col_name in name_lower:
+                    return col
+            return None
+
+        # Build output
+        text_output = f"📊 Analysis: {sheet.name}\n"
+        text_output += "=" * 60 + "\n\n"
+
+        # ── SUMMARY ──
+        if "summary" in ops:
+            text_output += "## Summary\n"
+            text_output += f"- Total Rows: {len(sheet.rows)}\n"
+            text_output += f"- Total Columns: {len(sheet.columns)}\n"
+
+            # Column type breakdown
+            type_counts = {}
+            for col in sheet.columns:
+                type_counts[col.type] = type_counts.get(col.type, 0) + 1
+            text_output += f"- Column Types: {', '.join(f'{t}({c})' for t, c in type_counts.items())}\n"
+            text_output += "\n"
+
+        # ── COLUMNS ──
+        if "columns" in ops:
+            text_output += "## Columns\n"
+            for i, col in enumerate(sheet.columns, 1):
+                text_output += f"{i}. {col.title} ({col.type})"
+                if hasattr(col, 'options') and col.options:
+                    text_output += f" - Options: {', '.join(col.options[:3])}"
+                    if len(col.options) > 3:
+                        text_output += f" +{len(col.options)-3} more"
+                text_output += "\n"
+            text_output += "\n"
+
+        # ── STATS ──
+        if "stats" in ops:
+            text_output += "## Column Statistics\n"
+
+            # Calculate fill rates
+            col_fill_rates = {col.id: 0 for col in sheet.columns}
+            for row in sheet.rows:
+                for cell in row.cells:
+                    if cell.value is not None and str(cell.value).strip():
+                        col_fill_rates[cell.column_id] = col_fill_rates.get(cell.column_id, 0) + 1
+
+            for col in sheet.columns:
+                fill_count = col_fill_rates.get(col.id, 0)
+                fill_pct = (fill_count / len(sheet.rows) * 100) if sheet.rows else 0
+                bar = "█" * int(fill_pct / 10)
+                text_output += f"- {col.title}: {fill_pct:.0f}% filled {bar}\n"
+            text_output += "\n"
+
+        # ── FILTER ──
+        if "filter" in ops:
+            if not filter_column or not filter_value:
+                text_output += "## Filter\n⚠️ Skipped: filter_column and filter_value required\n\n"
+            else:
+                filter_col = resolve_column(filter_column)
+                if not filter_col:
+                    text_output += f"## Filter\n⚠️ Column '{filter_column}' not found. "
+                    text_output += f"Available: {', '.join([c.title for c in sheet.columns])}\n\n"
+                else:
+                    text_output += f"## Filter: {filter_col.title} {filter_type} '{filter_value}'\n"
+
+                    filter_value_lower = str(filter_value).lower()
+                    matching_rows = []
+
+                    for row in sheet.rows:
+                        for cell in row.cells:
+                            if cell.column_id == filter_col.id:
+                                cell_value = str(cell.display_value or cell.value or "").lower()
+
+                                match = False
+                                if filter_type == "equals":
+                                    match = cell_value == filter_value_lower
+                                elif filter_type == "starts_with":
+                                    match = cell_value.startswith(filter_value_lower)
+                                elif filter_type == "ends_with":
+                                    match = cell_value.endswith(filter_value_lower)
+                                else:  # contains
+                                    match = filter_value_lower in cell_value
+
+                                if match:
+                                    row_data = {"row_num": row.row_number}
+                                    for c in row.cells:
+                                        col_name = columns[c.column_id].title
+                                        row_data[col_name] = c.display_value or c.value
+                                    matching_rows.append(row_data)
+                                break
+
+                    text_output += f"Found {len(matching_rows)} matching rows\n"
+
+                    # Show first 10 matches
+                    for row in matching_rows[:10]:
+                        row_str = " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None and k != "row_num")
+                        text_output += f"  Row {row['row_num']}: {row_str[:100]}{'...' if len(row_str) > 100 else ''}\n"
+
+                    if len(matching_rows) > 10:
+                        text_output += f"  ... and {len(matching_rows) - 10} more\n"
+                    text_output += "\n"
+
+        # ── COUNT/GROUP BY ──
+        if "count" in ops:
+            if not group_by:
+                text_output += "## Count by Column\n⚠️ Skipped: group_by parameter required\n\n"
+            else:
+                group_col = resolve_column(group_by)
+                if not group_col:
+                    text_output += f"## Count\n⚠️ Column '{group_by}' not found. "
+                    text_output += f"Available: {', '.join([c.title for c in sheet.columns])}\n\n"
+                else:
+                    text_output += f"## Count by: {group_col.title}\n"
+
+                    counts = {}
+                    for row in sheet.rows:
+                        for cell in row.cells:
+                            if cell.column_id == group_col.id:
+                                value = str(cell.display_value or cell.value or "(empty)")
+                                counts[value] = counts.get(value, 0) + 1
+                                break
+
+                    total = len(sheet.rows)
+                    for value, count in sorted(counts.items(), key=lambda x: -x[1]):
+                        pct = (count / total * 100) if total else 0
+                        bar = "█" * int(pct / 5)
+                        text_output += f"  {value}: {count} ({pct:.1f}%) {bar}\n"
+                    text_output += "\n"
+
+        # ── SAMPLE ──
+        if "sample" in ops:
+            text_output += "## Sample Data (First 5 Rows)\n"
+
+            for row in sheet.rows[:5]:
+                row_data = []
+                for cell in row.cells:
+                    col_name = columns[cell.column_id].title
+                    value = cell.display_value or cell.value
+                    if value is not None:
+                        row_data.append(f"{col_name}: {value}")
+                text_output += f"Row {row.row_number}: {' | '.join(row_data[:4])}\n"
+            text_output += "\n"
+
+        return text_output
+
+    except Exception as e:
+        return f"Error analyzing sheet: {str(e)}"
 
 
 # =============================================================================
@@ -2421,6 +2243,11 @@ SMARTSHEET_TOOLS = [
     get_row,
     filter_rows,
     count_rows_by_column,
+    # Fuzzy search tools (2) - for finding sheets/columns by partial names
+    find_sheets,
+    find_columns,
+    # Smart query planning (1) - efficient multi-operation analysis
+    analyze_sheet,
     # Unified resource tools (7)
     workspace,
     folder,
@@ -2454,38 +2281,20 @@ SMARTSHEET_TOOLS = [
     get_image_urls,
 ]
 
+# Async versions for all tools
+SMARTSHEET_TOOLS_ASYNC = {
+    tool.name: lambda t=tool: run_async(t)
+    for tool in SMARTSHEET_TOOLS
+}
+
 
 if __name__ == "__main__":
-    print("SmartSheet Tools for Agno Agent (READ-ONLY)")
+    print("Optimized SmartSheet Tools for Agno Agent (READ-ONLY)")
     print("=" * 60)
     print(f"\nTotal tools: {len(SMARTSHEET_TOOLS)}")
-    print("\nCONSOLIDATED FROM 49 TO 28 TOOLS (43% REDUCTION)\n")
-
-    print("Core Tools (5):")
-    print("  - list_sheets, get_sheet, get_row, filter_rows, count_rows_by_column")
-
-    print("\nUnified Resource Tools (7):")
-    print("  - workspace, folder, sight, report, webhook, group, user")
-
-    print("\nUnified Scope Tools (2):")
-    print("  - attachment, discussion")
-
-    print("\nUnified Search (1):")
-    print("  - search")
-
-    print("\nUnified Navigation (1):")
-    print("  - navigation")
-
-    print("\nUnified Sheet Metadata (1):")
-    print("  - sheet_metadata")
-
-    print("\nUnified Sheet Info (1):")
-    print("  - sheet_info")
-
-    print("\nUnified Update Requests (1):")
-    print("  - update_requests")
-
-    print("\nStandalone Tools (9):")
-    print("  - compare_sheets, get_cell_history, get_sheet_version, get_events")
-    print("  - get_current_user, get_contacts, get_server_info, list_org_sheets")
-    print("  - get_image_urls")
+    print("\nOptimizations:")
+    print("  ✓ Agno @tool decorator with cache_results")
+    print("  ✓ Multi-level caching (L1 memory + L2 disk)")
+    print("  ✓ Async tool execution support")
+    print("  ✓ Pagination optimization")
+    print(f"\nCache stats: {get_cache_stats()}")

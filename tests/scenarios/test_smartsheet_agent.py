@@ -6,6 +6,7 @@ and calls the appropriate Smartsheet tools.
 """
 
 import os
+
 import pytest
 import scenario
 from dotenv import load_dotenv
@@ -26,10 +27,11 @@ scenario.configure(default_model="openai/gpt-4o-mini")
 
 def create_smartsheet_agent():
     """Create a fresh instance of the Smartsheet agent for testing."""
+    import langwatch
     from agno.agent import Agent
     from agno.models.openrouter import OpenRouter
-    from smartsheet_tools_optimized import SMARTSHEET_TOOLS
-    import langwatch
+
+    from smartsheet_tools import SMARTSHEET_TOOLS
 
     # Get system prompt from LangWatch
     prompt = langwatch.prompts.get("smartsheet-agent")
@@ -282,9 +284,9 @@ async def test_agent_uses_efficient_analysis_for_complex_queries():
     result = await scenario.run(
         name="efficient multi-operation analysis",
         description="""
-        User asks a complex question about a specific sheet that requires multiple pieces 
-        of information. The agent should search for the sheet and either provide analysis 
-        or confirm before proceeding. The key is that the agent attempts to help with 
+        User asks a complex question about a specific sheet that requires multiple pieces
+        of information. The agent should search for the sheet and either provide analysis
+        or confirm before proceeding. The key is that the agent attempts to help with
         the multi-faceted request.
         """,
         agents=[

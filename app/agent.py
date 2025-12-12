@@ -4,19 +4,27 @@ Enhanced Smartsheet Agent with structured outputs and session management.
 This module provides:
 - Structured output support via Pydantic models
 - User-based session management with persistent memory
-- LangWatch instrumentation
+- Optional LangWatch instrumentation
 - Reusable agent factory
 """
 
 import os
-from typing import Optional, List
-from dotenv import load_dotenv
-from agno.agent import Agent
-from agno.models.openrouter import OpenRouter
-from agno.db.sqlite import SqliteDb
-import langwatch
+from typing import Optional
 
-from smartsheet_tools_optimized import SMARTSHEET_TOOLS, get_cache_stats
+from agno.agent import Agent
+from agno.db.sqlite import SqliteDb
+from agno.models.openrouter import OpenRouter
+from dotenv import load_dotenv
+
+# Optional LangWatch integration
+try:
+    import langwatch
+    LANGWATCH_AVAILABLE = True
+except ImportError:
+    LANGWATCH_AVAILABLE = False
+    langwatch = None
+
+from smartsheet_tools import SMARTSHEET_TOOLS
 
 # Load environment variables
 load_dotenv()
@@ -25,13 +33,33 @@ load_dotenv()
 DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 DB_FILE = "tmp/smartsheet_agent.db"
 
+# Default system prompt (used when LangWatch is not available)
+DEFAULT_SYSTEM_PROMPT = """You are a Smartsheet data assistant with READ-ONLY access to Smartsheet data.
+
+Your capabilities:
+- List and search sheets, reports, dashboards, and workspaces
+- Query and filter data from sheets
+- Analyze metrics and generate summaries
+- View cell history and audit information
+- Access attachments, discussions, and sharing info
+
+Important guidelines:
+- You can only READ data - no modifications are possible
+- Always use the appropriate tool for the task
+- When users ask about sheets by partial name, use find_sheets() first
+- When users ask about columns by partial name, use find_columns() first
+- For complex analysis, prefer analyze_sheet() to minimize API calls
+- Present data clearly and concisely
+
+Be helpful, accurate, and efficient in answering questions about Smartsheet data."""
+
 
 class SmartsheetAgentFactory:
     """Factory for creating Smartsheet agents with proper configuration."""
 
     _instance: Optional["SmartsheetAgentFactory"] = None
     _agents: dict[str, Agent] = {}
-    _db: Optional[SqliteDb] = None
+    _db: SqliteDb | None = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -49,24 +77,28 @@ class SmartsheetAgentFactory:
 
     @staticmethod
     def get_system_prompt() -> str:
-        """Get the system prompt from LangWatch prompt management."""
-        prompt = langwatch.prompts.get("smartsheet-agent")
-        for message in prompt.messages:
-            if message.get("role") == "system":
-                return message.get("content", "")
-        return ""
+        """Get the system prompt from LangWatch prompt management or fallback."""
+        if LANGWATCH_AVAILABLE:
+            try:
+                prompt = langwatch.prompts.get("smartsheet-agent")
+                for message in prompt.messages:
+                    if message.get("role") == "system":
+                        return message.get("content", "")
+            except Exception:
+                pass  # Fall through to default
+        return DEFAULT_SYSTEM_PROMPT
 
     @staticmethod
-    def get_model(model_id: Optional[str] = None) -> OpenRouter:
+    def get_model(model_id: str | None = None) -> OpenRouter:
         """Get the configured OpenRouter model."""
         model = model_id or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         return OpenRouter(id=model)
 
     def get_agent(
         self,
-        user_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        model_id: Optional[str] = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        model_id: str | None = None,
         enable_memory: bool = True,
     ) -> Agent:
         """
@@ -112,7 +144,7 @@ class SmartsheetAgentFactory:
         self._agents[cache_key] = agent
         return agent
 
-    def get_user_memories(self, user_id: str) -> List:
+    def get_user_memories(self, user_id: str) -> list:
         """
         Get all memories stored for a specific user.
 
@@ -144,12 +176,33 @@ class SmartsheetAgentFactory:
 agent_factory = SmartsheetAgentFactory()
 
 
-@langwatch.trace(name="smartsheet_agent_run")
+def _run_smartsheet_agent_impl(
+    query: str,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    model_id: str | None = None,
+    stream: bool = True,
+) -> str:
+    """Internal implementation of run_smartsheet_agent."""
+    agent = agent_factory.get_agent(
+        user_id=user_id,
+        session_id=session_id,
+        model_id=model_id,
+    )
+
+    if stream:
+        agent.print_response(query, stream=True)
+        return ""
+    else:
+        response = agent.run(query)
+        return response.content if response else ""
+
+
 def run_smartsheet_agent(
     query: str,
-    user_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    model_id: Optional[str] = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    model_id: str | None = None,
     stream: bool = True,
 ) -> str:
     """
@@ -165,23 +218,18 @@ def run_smartsheet_agent(
     Returns:
         The agent's response as a string
     """
-    agent = agent_factory.get_agent(
-        user_id=user_id,
-        session_id=session_id,
-        model_id=model_id,
-    )
-
-    if stream:
-        agent.print_response(query, stream=True)
-        return ""
+    if LANGWATCH_AVAILABLE:
+        @langwatch.trace(name="smartsheet_agent_run")
+        def traced_run():
+            return _run_smartsheet_agent_impl(query, user_id, session_id, model_id, stream)
+        return traced_run()
     else:
-        response = agent.run(query)
-        return response.content if response else ""
+        return _run_smartsheet_agent_impl(query, user_id, session_id, model_id, stream)
 
 
 def create_agent_for_testing(
-    user_id: Optional[str] = None,
-    model_id: Optional[str] = None,
+    user_id: str | None = None,
+    model_id: str | None = None,
 ) -> Agent:
     """
     Create a fresh agent instance for testing.
