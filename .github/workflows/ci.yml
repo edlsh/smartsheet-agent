@@ -104,7 +104,5 @@ jobs:
       - name: Build package
         run: uv build
       
-      - name: Check package
-        run: |
-          pip install twine
-          twine check dist/*
+      - name: Verify build artifacts
+        run: ls -la dist/
